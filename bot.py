@@ -21,7 +21,7 @@ DEFAULTS = {
     "REVIEWS_URL": "https://t.me/recontrolreviews",
     "CHANNEL_URL": "https://t.me/recontroltags",
     "MANAGER": "@recontrol_tags_manager",
-    "PAYMENT_DETAILS": "Карта: 2200 7019 7581 7047\nСБП: +7 966 047 16-44\nБанк: Т-Банк",
+    "PAYMENT_DETAILS": "Карта: 2200 7019 7581 7047\nСБП: +7 916 345 90-00\nБанк: Т-Банк",
 }
 
 
