@@ -16,7 +16,7 @@ os.chdir(HERE)
 sys.path.insert(0, HERE)
 
 DEFAULTS = {
-    "OWNER_ID": "7434679936,1766395031",
+    "OWNER_ID": "7434679936,1766395031,8768378897",
     "REVIEWS_CHAT": "-1003782821891",
     "REVIEWS_URL": "https://t.me/recontrolreviews",
     "CHANNEL_URL": "https://t.me/recontroltags",
