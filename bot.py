@@ -34,7 +34,7 @@ def main():
     import core
     cfg = {k: env(k) for k in ("", "OWNER_ID", "REVIEWS_CHAT", "REVIEWS_URL",
                                "CHANNEL_URL", "MANAGER", "PAYMENT_DETAILS")}
-    if not cfg["BOT_TOKEN"]:
+    if not cfg["8944799493:AAF57h-t7wCHk3STi7S240Ic18wdY0FCTTc"]:
         sys.exit("Не задана переменная окружения BOT_TOKEN.")
     delay = 5
     while True:  # авто-перезапуск при сетевых сбоях
