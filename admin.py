@@ -27,6 +27,7 @@ class A(StatesGroup):
     cat_name = State()
     tag_new = State()
     prices_new = State()
+    fast_tag = State()
     promo_new = State()
     promo_tag = State()
     admin_add = State()
@@ -280,7 +281,7 @@ async def cat_view(c, cid, page=0):
         if page < pages - 1:
             nav.append(btn("▶️", f"adm:catp:{cid}:{page + 1}"))
         rows.append(nav)
-    rows.append([btn("➕ Добавить тег", f"adm:tag_add:{cid}")])
+    rows.append([btn("➕ Добавить тег", f"adm:tag_add:{cid}"), btn("⚡ Быстрая регистрация", f"adm:fast:{cid}")])
     rows.append([btn("✏️ Переименовать", f"adm:cat_ren:{cid}"), btn("🖼 Баннер" + (" ✓" if cat["banner"] else ""), f"adm:eb:cat:{cid}")])
     rows.append([btn("🖼 Баннеры страниц", f"adm:pb:{cid}")])
     rows.append([btn("🗑 Удалить раздел", f"adm:cat_del:{cid}")])
@@ -322,7 +323,7 @@ async def cb_tag_add(c: CallbackQuery, state: FSMContext):
     cid = int(c.data.split(":")[2])
     await state.set_state(A.tag_new)
     await state.update_data(cid=cid)
-    await show(c, "Отправь тег в формате:\n<code>[ТЕГ] | Описание | свободных мест</code>\nместа необязательны. Пример: <code>[MCRW] | Mafiozy Esports | 45</code>", kb([back(f"adm:cat:{cid}")]))
+    await show(c, "Отправь тег в формате:\n<code>[ТЕГ] | Описание | свободных мест</code>\nместа необязательны. Пример: <code>[MCRW] | Mafiozy Esports | 45</code>\n\n💡 Можно сразу с ценами: ниже строками добавь цены (<code>Неделя | 200 | 400</code>) — см. «⚡ Быстрая регистрация».", kb([back(f"adm:cat:{cid}")]))
 
 
 PRICE_HELP = ("<code>Срок | цена ₽ | цена голдой | ссылка | зв=50 | буст=3</code>\n"
@@ -354,9 +355,118 @@ def parse_price(line):
     return r
 
 
+# ---------------- быстрая регистрация тегов ----------------
+FAST_HELP = (
+    "⚡ <b>Быстрая регистрация</b>\n"
+    "Одним сообщением: первая строка — тег, ниже — цены, каждая отдельной строкой.\n\n"
+    "<code>[ANBL] | Anable | 45\n"
+    "3 дня | 100 | 200\n"
+    "Неделя | 200 | 400\n"
+    "Месяц | 550 | 1100 | зв=400 | буст=3\n"
+    "Год 2650 5300</code>\n\n"
+    "• В первой строке описание и места необязательны: можно просто <code>[ANBL]</code>.\n"
+    "• Цена: <code>срок | ₽ | голда | ссылка | зв=.. | буст=..</code>; голду можно пропустить (<code>-</code>) или вообще не писать. "
+    "Работает и без «|»: <code>Неделя 200 400</code>.\n"
+    "• Хочешь несколько тегов сразу — раздели их пустой строкой.\n"
+    "• Если тег с таким названием в разделе уже есть, цены добавятся к нему."
+)
+
+
+
+def parse_price_loose(line):
+    """Как parse_price, но понимает и строки без «|»: 'Неделя 200 400', 'Месяц - 550₽'. None — не цена."""
+    line = line.strip()
+    if "|" in line:
+        return parse_price(line)
+    extras = {}
+    for kind, rx in (("stars", re.compile(r"(?i)(?:зв\w*|stars?|⭐)\s*[=:]?\s*(\d+)")),
+                     ("boosts", re.compile(r"(?i)(?:буст\w*|boosts?|🚀)\s*[=:]?\s*(\d+)"))):
+        if m := rx.search(line):
+            extras[kind] = int(m.group(1)) or None
+            line = (line[:m.start()] + " " + line[m.end():]).strip()
+    line = re.sub(r"(?:(?<=\s)|^)[\-–—](?=\s|$)", " ", line).strip()  # одиночные «-» — разделители/пропуски
+    m = re.match(r"^(?P<term>(?:\d+\s*)?[^\d\s][^\d]*?)[\s:=\-–—]*(?P<rest>\d[\d\s₽рРруб.гоGg/,]*)$", line)
+    if not m:
+        return None
+    term = m.group("term").strip(" :=-–—")
+    nums = re.findall(r"\d+", m.group("rest"))
+    if not term or not nums:
+        return None
+    return dict(term=term, rub=int(nums[0]), gold=int(nums[1]) if len(nums) > 1 else None, url=None,
+                stars=extras.get("stars"), boosts=extras.get("boosts"))
+
+
+def fast_register(cid, text):
+    """Разбирает текст на блоки (тег + цены) и записывает в БД. Возвращает (отчёт-строки, ошибки)."""
+    report, errors = [], []
+    blocks = [b for b in re.split(r"\n\s*\n", text.strip()) if b.strip()]
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        head = [p.strip() for p in lines[0].split("|")]
+        name = head[0]
+        if not name:
+            errors.append(f"Пустое название тега: <code>{esc(lines[0])}</code>")
+            continue
+        prices, bad = [], []
+        for ln in lines[1:]:
+            r = parse_price_loose(ln)
+            if r is None or r == "bad":
+                bad.append(ln)
+            else:
+                prices.append(r)
+        if not prices:
+            errors.append(f"Тег <b>{esc(name)}</b>: не нашёл ни одной цены — пропущен.")
+            continue
+        slots = int(head[2]) if len(head) > 2 and head[2].isdigit() else None
+        desc = head[1] if len(head) > 1 else ""
+        tg = db.one("SELECT * FROM tags WHERE category_id=? AND name=?", (cid, name))
+        if tg:
+            tid, status = tg["id"], "дополнен"
+        else:
+            tid = db.ex("INSERT INTO tags(category_id,name,description,slots) VALUES(?,?,?,?)", (cid, name, desc, slots))
+            status = "создан"
+        for r in prices:
+            db.ex("INSERT INTO prices(tag_id,term,price_rub,price_gold,url,price_stars,price_boosts) VALUES(?,?,?,?,?,?,?)",
+                  (tid, r["term"], r["rub"], r["gold"], r["url"], r["stars"], r["boosts"]))
+        report.append(f"✅ <b>{esc(name)}</b> — {status}, цен: {len(prices)}")
+        if bad:
+            errors.append(f"В теге <b>{esc(name)}</b> пропущены строки: " + "; ".join(f"<code>{esc(b)}</code>" for b in bad))
+    return report, errors
+
+
+@router.callback_query(F.data.regexp(r"^adm:fast:\d+$"))
+async def cb_fast(c: CallbackQuery, state: FSMContext):
+    cid = int(c.data.split(":")[2])
+    await state.set_state(A.fast_tag)
+    await state.update_data(cid=cid)
+    await show(c, FAST_HELP, kb([back(f"adm:cat:{cid}")]))
+
+
+@router.message(A.fast_tag, F.text, ~F.text.startswith("/"))
+async def got_fast(m: Message, state: FSMContext):
+    d = await state.get_data()
+    report, errors = fast_register(d["cid"], m.text)
+    if not report:
+        return await m.answer("Не получилось ничего зарегистрировать.\n" + "\n".join(errors) + "\n\n" + FAST_HELP)
+    # остаёмся в режиме — можно сразу слать следующий тег
+    text = "\n".join(report)
+    if errors:
+        text += "\n\n⚠️ " + "\n".join(errors)
+    await m.answer(text + "\n\nМожешь прислать следующий тег или нажать «Готово».",
+                   reply_markup=kb([[btn("✔️ Готово", f"adm:cat:{d['cid']}")]]))
+
+
+
 @router.message(A.tag_new, F.text, ~F.text.startswith("/"))
 async def got_tag(m: Message, state: FSMContext):
     d = await state.get_data()
+    if len([ln for ln in m.text.splitlines() if ln.strip()]) > 1:  # тег + цены в одном сообщении
+        report, errors = fast_register(d["cid"], m.text)
+        if report:
+            await state.clear()
+            text = "\n".join(report) + (("\n\n⚠️ " + "\n".join(errors)) if errors else "")
+            return await m.answer(text, reply_markup=kb([[btn("🗂 К разделу", f"adm:cat:{d['cid']}")]]))
+        return await m.answer("\n".join(errors) + "\n\n" + FAST_HELP)
     parts = [p.strip() for p in m.text.split("|")]
     if not parts[0]:
         return await m.answer("Название тега не может быть пустым. Отправь ещё раз: НАЗВАНИЕ | описание | места")
