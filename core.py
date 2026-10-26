@@ -32,7 +32,7 @@ def to_token(value):
 
 
 async def main(cfg):
-   token = to_token(cfg.get("BOT_TOKEN")) or to_token(os.environ.get("BOT_TOKEN"))
+    token = to_token(cfg.get("BOT_TOKEN")) or to_token(os.environ.get("BOT_TOKEN"))
     owners = to_ids(cfg.get("OWNER_ID")) or to_ids(os.environ.get("OWNER_ID"))
     if not token or ":" not in token:
         raise SystemExit(
