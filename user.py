@@ -6,7 +6,7 @@ import re
 import time
 
 from aiogram import Router, F, Bot, BaseMiddleware
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest
@@ -133,9 +133,17 @@ def back_menu():
 
 
 @router.message(CommandStart())
-async def start(m: Message, state: FSMContext):
+async def start(m: Message, state: FSMContext, command: CommandObject = None):
     await state.clear()
+    is_new = db.one("SELECT 1 FROM users WHERE user_id=?", (m.from_user.id,)) is None
     db.ex("INSERT OR IGNORE INTO users(user_id,username,joined_at) VALUES(?,?,?)", (m.from_user.id, m.from_user.username, int(time.time())))
+    # реферальная ссылка: t.me/бот?start=ref_КОД — считаем каждого человека один раз
+    arg = (command.args or "").strip() if command else ""
+    if arg.startswith("ref_") and not db.is_admin(m.from_user.id):  # свои переходы админов не считаем
+        code = arg[4:]
+        if db.one("SELECT 1 FROM refs WHERE code=?", (code,)):
+            db.ex("INSERT OR IGNORE INTO ref_visits(code,user_id,is_new,at) VALUES(?,?,?,?)",
+                  (code, m.from_user.id, 1 if is_new else 0, int(time.time())))
     await show(m, t("welcome"), main_menu(), "main")
 
 
@@ -208,8 +216,8 @@ async def cb_orders(c: CallbackQuery, state: FSMContext):
         lines = [t("txt_orders_title") + "\n"]
         for o in rows:
             lines.append(
-                f"#{o['id']} · {esc(o['tag'])} · {esc(o['term'])} · {esc(o['amount'])}"
-                f"{' ₽' if o['method'] == 'card' else ' г'} — {st.get(o['status'], o['status'])}"
+                f"#{o['id']} · {esc(o['tag'])} · {esc(o['term'])} · {db.money(o['amount'], o['method'])}"
+                f" — {st.get(o['status'], o['status'])}"
             )
         text = "\n".join(lines)
         rv = [btn(t("btn_review_order", id=o["id"]), f"rv:start:{o['id']}") for o in rows
@@ -262,7 +270,22 @@ async def cb_cat(c: CallbackQuery):
     text = t("txt_cat_page", name=esc(cat["name"]), page=page + 1, pages=pages)
     if not tags:
         text = t("txt_cat_empty", name=esc(cat["name"]))
-    await show(c, text, kb(rows), "tags", fid=db.page_banner(cid, page) or cat["banner"])
+    manual = db.page_banner(cid, page)  # баннер, загруженный админом вручную, главнее автоматического
+    gen = None
+    if not manual and chunk:
+        try:
+            gen = await make_tags_banner([tg["name"] for tg in chunk])
+        except Exception:
+            logging.exception("Не удалось собрать баннер страницы тегов")
+    await show(c, text, kb(rows), "tags", fid=manual or (None if gen else cat["banner"]), gen=gen)
+
+
+async def make_tags_banner(names):
+    """Баннер «Выбери тэг» для страницы раздела: названия тегов страницы, лишние плашки стёрты."""
+    key = "tags:" + hashlib.sha1("\n".join(names).encode()).hexdigest()
+    if key in _banner_ids:
+        return key, b""
+    return key, await asyncio.to_thread(banner.render_tags, names=names)
 
 
 async def make_terms_banner(tag_name, banner_rows):
@@ -305,7 +328,7 @@ async def cb_tag(c: CallbackQuery, state: FSMContext):
     tcat = db.one("SELECT banner FROM categories WHERE id=?", (tag["category_id"],))
     prices = db.q("SELECT * FROM prices WHERE tag_id=? ORDER BY price_rub", (tid,))
     pr = db.active_promo(c.from_user.id)
-    pct = pr[1] if pr else 0
+    pct = db.pct_for(pr, tid)
     rows = []
     sold_out = tag["slots"] is not None and tag["slots"] <= 0
     closed = bool(tag["closed"])
@@ -326,8 +349,9 @@ async def cb_tag(c: CallbackQuery, state: FSMContext):
             continue
         rub = db.apply_discount(p["price_rub"], pct)
         gold = db.apply_discount(p["price_gold"], pct)
-        banner_rows.append((p["term"], rub, False, gold))
-        label = f"{p['term']} | {fmt(rub)}₽" + (f" / {fmt(gold)}г" if gold else "")
+        stars = db.apply_discount(p["price_stars"], pct) if p["price_stars"] else None
+        banner_rows.append((p["term"], rub, False, gold, stars))
+        label = f"{p['term']} | {fmt(rub)}₽" + (f" / {fmt(gold)}г" if gold else "") + (f" / {fmt(stars)}⭐" if stars else "")
         rows.append([btn(label, f"price:{p['id']}")])
     if manager_url():
         rows.append([btn(t("btn_contact"), url=manager_url())])
@@ -343,7 +367,7 @@ async def cb_tag(c: CallbackQuery, state: FSMContext):
         text += "\n\n" + t("txt_site_pay")
     else:
         text += "\n\n" + t("txt_choose_term")
-    if pr and not site:
+    if pct and not site:
         text += "\n\n" + t("txt_promo_active", code=esc(pr[0]), pct=pct)
     gen = None
     if not tag["banner"] and banner_rows:
@@ -417,8 +441,28 @@ def calc(data, user_id):
     if not p or is_closed(p["id"]):  # цену/тег удалили или закрыли, пока покупатель оформлял заказ
         return None, None, None, None
     pr = db.active_promo(user_id)
-    pct = pr[1] if pr else 0
+    pct = db.pct_for(pr, p["tag_id"])
+    if not pct:  # промокод на другой тег — к этому заказу не применяется
+        pr = None
     return p, pr, db.apply_discount(p["price_rub"], pct), db.apply_discount(p["price_gold"], pct)
+
+
+def stars_word(n):
+    return banner.stars_word(n)
+
+
+def extra_prices(p, pr):
+    """Цены в звёздах и бустах для срока (или None). Скидка промокода действует только на звёзды;
+    бусты — штучный товар, скидка к ним не применяется."""
+    pct = pr[1] if pr else 0
+    stars = db.apply_discount(p["price_stars"], pct) if p["price_stars"] else None
+    boosts = p["price_boosts"] or None
+    return stars, boosts
+
+
+def contact_for(key):
+    """Юзернейм, куда писать при оплате звёздами/бустами; если не задан — менеджер."""
+    return esc(links.norm_handle(db.get_setting(key)) or manager_handle())
 
 
 HOLD_MIN = 30  # сколько минут держим место после показа реквизитов
@@ -473,10 +517,19 @@ async def summary(target, state: FSMContext):
         lines.append(t("txt_order_card", price=f"{fmt(rub)} ₽"))
     if gold:
         lines.append(t("txt_order_gold", price=fmt(gold)))
+    stars, boosts = extra_prices(p, pr)
+    if stars:
+        lines.append(t("txt_order_stars", price=fmt(stars)))
+    if boosts:
+        lines.append(t("txt_order_boost", price=fmt(boosts)))
     lines.append("\n" + t("txt_order_choose_pay"))
     rows = [[btn(t("btn_pay_card", price=fmt(rub)), "pay:card")]]
     if gold:
         rows.append([btn(t("btn_pay_gold", price=fmt(gold)), "pay:gold")])
+    if stars:
+        rows.append([btn(t("btn_pay_stars", price=fmt(stars)), "pay:stars")])
+    if boosts:
+        rows.append([btn(t("btn_pay_boost", price=fmt(boosts)), "pay:boost")])
     rows.append([btn(t("btn_apply_promo"), "promo:order")])
     rows.append([btn(t("btn_other_term"), f"tag:{p['tag_id']}_keep"), btn(t("btn_other_id"), "order:chid")])
     rows.append([btn(t("btn_menu"), "menu:main")])
@@ -502,7 +555,7 @@ async def cb_tag_keep(c: CallbackQuery, state: FSMContext):
     tag = db.one("SELECT * FROM tags WHERE id=?", (tid,))
     prices = db.q("SELECT * FROM prices WHERE tag_id=? ORDER BY price_rub", (tid,))
     pr = db.active_promo(c.from_user.id)
-    pct = pr[1] if pr else 0
+    pct = db.pct_for(pr, tid)
     rows = []
     for p in prices:
         if tag["closed"]:
@@ -533,7 +586,9 @@ async def cb_promo(c: CallbackQuery, state: FSMContext):
     cur = db.active_promo(c.from_user.id)
     text = t("txt_promo_screen")
     if cur:
-        text += "\n\n" + t("txt_promo_current", code=esc(cur[0]), pct=cur[1])
+        ctag = db.promo_tag(cur[0])
+        text += "\n\n" + (t("txt_promo_current_tag", code=esc(cur[0]), pct=cur[1], tag=esc(ctag["name"])) if ctag
+                          else t("txt_promo_current", code=esc(cur[0]), pct=cur[1]))
     back = "order:back" if from_order else "menu:main"
     await show(c, text, kb([[btn(t("btn_back"), back)]]), "promo")
 
@@ -553,17 +608,25 @@ async def got_promo(m: Message, state: FSMContext):
     db.activate_promo(m.from_user.id, code)
     data = await state.get_data()
     await state.set_state(None)
+    ptag = db.promo_tag(code)  # None — промокод на все теги
     if data.get("promo_from_order") and data.get("price_id") and data.get("game_id"):
-        await m.answer(t("txt_promo_ok_order", code=esc(code), pct=percent))
+        price = db.one("SELECT tag_id FROM prices WHERE id=?", (data["price_id"],))
+        if ptag and price and price["tag_id"] != ptag["id"]:
+            await m.answer(t("txt_promo_wrong_tag", code=esc(code), tag=esc(ptag["name"])))
+        elif ptag:
+            await m.answer(t("txt_promo_ok_order_tag", code=esc(code), pct=percent, tag=esc(ptag["name"])))
+        else:
+            await m.answer(t("txt_promo_ok_order", code=esc(code), pct=percent))
         return await summary(m, state)
     await m.answer(
-        t("txt_promo_ok", code=esc(code), pct=percent),
+        t("txt_promo_ok_tag", code=esc(code), pct=percent, tag=esc(ptag["name"])) if ptag
+        else t("txt_promo_ok", code=esc(code), pct=percent),
         reply_markup=kb([[btn(t("btn_to_catalog"), "menu:catalog")], [btn(t("btn_menu"), "menu:main")]]),
     )
 
 
 # ---------------- оплата ----------------
-@router.callback_query(F.data.in_({"pay:card", "pay:gold"}))
+@router.callback_query(F.data.in_({"pay:card", "pay:gold", "pay:stars", "pay:boost"}))
 async def cb_pay(c: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if not data.get("price_id") or not data.get("game_id"):
@@ -574,10 +637,18 @@ async def cb_pay(c: CallbackQuery, state: FSMContext):
         return await show(c, gone_text(data), main_menu())
     if p["price_gold"] is None and c.data == "pay:gold":
         return await c.answer(t("txt_session_expired"), show_alert=True)
-    method = "card" if c.data == "pay:card" else "gold"
-    amount = rub if method == "card" else gold
+    method = c.data.split(":")[1]
+    stars, boosts = extra_prices(p, pr)
+    amount = {"card": rub, "gold": gold, "stars": stars, "boost": boosts}[method]
+    if not amount:  # админ убрал этот способ оплаты, пока покупатель оформлял заказ
+        return await c.answer(t("txt_session_expired"), show_alert=True)
     order_no = data.get("order_no") or db.reserve_order_number()
-    if method == "card":
+    if method in ("stars", "boost"):
+        key = "txt_pay_stars" if method == "stars" else "txt_pay_boost"
+        text = t(key, price=fmt(amount), contact=contact_for("stars_contact" if method == "stars" else "boost_contact"),
+                 tag=esc(p["tname"]), term=esc(p["term"]), minutes=HOLD_MIN,
+                 order=f"PT-{order_no}", game_id=esc(data["game_id"]))
+    elif method == "card":
         text = t("txt_pay_card", price=fmt(amount), details=format_details(db.get_setting("payment_details")),
                  tag=esc(f"{p['tname']}"), term=esc(p["term"]), minutes=HOLD_MIN,
                  order=f"PT-{order_no}")
@@ -588,8 +659,10 @@ async def cb_pay(c: CallbackQuery, state: FSMContext):
     await state.update_data(method=method, order_no=order_no, pay_started=int(time.time()))
     gen = None
     try:
-        sub = None if method == "card" else t("bn_pay_gold_sub")
-        args = dict(amount=amount, unit="₽" if method == "card" else "г", subtitle=sub)
+        sub = t("bn_pay_gold_sub") if method == "gold" else (
+            t("bn_pay_other_sub") if method in ("stars", "boost") else None)
+        unit = {"card": "₽", "gold": "г", "stars": stars_word(amount), "boost": "буст."}[method]
+        args = dict(amount=amount, unit=unit, subtitle=sub)
         key = "pay:" + hashlib.sha1(repr(sorted(args.items(), key=lambda kv: kv[0])).encode()).hexdigest()
         gen = (key, b"" if key in _banner_ids else await asyncio.to_thread(banner.render_pay, **args))
     except Exception:
@@ -617,7 +690,7 @@ async def cb_done(c: CallbackQuery, state: FSMContext):
         await c.answer(t("txt_pay_expired", minutes=HOLD_MIN), show_alert=True)
         return await summary(c, state)
     await state.set_state(Order.proof)
-    key = "txt_proof_card" if data["method"] == "card" else "txt_proof_gold"
+    key = {"card": "txt_proof_card", "gold": "txt_proof_gold"}.get(data["method"], "txt_proof_shot")
     await show(c, t(key), kb([[btn(t("btn_back"), "pay:back")]]))
 
 
@@ -641,7 +714,7 @@ async def got_proof(m: Message, state: FSMContext, bot: Bot):
         if 4 <= len(digits) <= 19 and len(m.text) <= 40:  # номер карты (или последние цифры) отправителя
             card_text = " ".join(digits[i:i + 4] for i in range(0, len(digits), 4))
     if not file_id and not card_text:
-        bad = "txt_proof_bad" if data.get("method") == "card" else "txt_proof_bad_gold"
+        bad = {"card": "txt_proof_bad", "gold": "txt_proof_bad_gold"}.get(data.get("method"), "txt_proof_bad_shot")
         return await m.answer(t(bad), reply_markup=kb([[btn(t("btn_back"), "pay:back")]]))
     if not data.get("price_id") or not data.get("game_id") or not data.get("method"):
         await state.clear()
@@ -659,8 +732,13 @@ async def got_proof(m: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return await m.answer(t("txt_no_slots_alert"), reply_markup=main_menu())
     method = data["method"]
-    amount = rub if method == "card" else gold
-    promo_code = pr[0] if pr else None
+    stars, boosts = extra_prices(p, pr)
+    amount = {"card": rub, "gold": gold, "stars": stars, "boost": boosts}.get(method)
+    if not amount:
+        await state.clear()
+        return await m.answer(t("txt_session_expired"), reply_markup=main_menu())
+    # промокод тратится, только если скидка реально применена (к бустам скидка не действует)
+    promo_code = pr[0] if pr and method != "boost" else None
     oid = db.ex(
         "INSERT INTO orders(user_id,username,game_id,tag,term,method,amount,promo,created_at,tag_id,proof,id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (m.from_user.id, m.from_user.username, data["game_id"], f"{p['tname']} {p['tdesc']}".strip(),
@@ -673,7 +751,7 @@ async def got_proof(m: Message, state: FSMContext, bot: Bot):
     uname = f"@{m.from_user.username}" if m.from_user.username else f"id{m.from_user.id}"
     text = (f"🆕 <b>Новый заказ #{oid}</b>\n\n👤 {esc(uname)}\n🎮 ID: {esc(data['game_id'])}\n"
             f"🏷 {esc(p['tname'])} · {esc(p['term'])}\n"
-            f"💵 {fmt(amount)} {'₽' if method == 'card' else 'г'} ({'карта/СБП' if method == 'card' else 'голда'})"
+            f"💵 {db.money(amount, method)} ({db.METHOD_NAME[method]})"
             + (f"\n🎟 Промокод: {esc(promo_code)}" if promo_code else ""))
     markup = kb([[btn("✅ Подтвердить", f"adm:ok:{oid}"), btn("❌ Отклонить", f"adm:no:{oid}")]])
     for aid in db.admin_ids():

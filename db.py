@@ -20,6 +20,8 @@ DEFAULT_SETTINGS = {
     "channel_url": "https://t.me/",
     "reviews_chat": "",
     "maintenance": "0",
+    "stars_contact": "",   # юзернейм, куда писать при оплате звёздами (пусто = менеджер)
+    "boost_contact": "",   # юзернейм, куда писать при оплате бустами (пусто = менеджер)
     "payment_details": "Карта: 0000 0000 0000 0000\nПолучатель: Имя Ф.\nСБП: +7 000 000-00-00\n\nВ комментарии к переводу ничего писать не нужно.",
 }
 
@@ -63,12 +65,19 @@ def init(owner_id: int):
         CREATE TABLE IF NOT EXISTS order_numbers(id INTEGER PRIMARY KEY AUTOINCREMENT);
         CREATE TABLE IF NOT EXISTS page_banners(category_id INTEGER, page INTEGER, file_id TEXT, PRIMARY KEY(category_id, page));
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS refs(
+            code TEXT PRIMARY KEY, name TEXT, created_by INTEGER, created_at INTEGER);
+        CREATE TABLE IF NOT EXISTS ref_visits(
+            code TEXT, user_id INTEGER, is_new INTEGER DEFAULT 0, at INTEGER,
+            PRIMARY KEY(code, user_id));
         """
     )
     for tbl, col in [("tags", "slots INTEGER"), ("prices", "url TEXT"), ("orders", "tag_id INTEGER"),
                      ("categories", "banner TEXT"), ("tags", "banner TEXT"), ("tags", "hidden INTEGER DEFAULT 0"),
                      ("orders", "proof TEXT"), ("orders", "reviewed INTEGER DEFAULT 0"), ("users", "banned INTEGER DEFAULT 0"),
-                     ("tags", "closed INTEGER DEFAULT 0"), ("prices", "closed INTEGER DEFAULT 0")]:
+                     ("tags", "closed INTEGER DEFAULT 0"), ("prices", "closed INTEGER DEFAULT 0"),
+                     ("prices", "price_stars INTEGER"), ("prices", "price_boosts INTEGER"),
+                     ("promocodes", "tag_id INTEGER")]:  # tag_id: промокод только на этот тег (NULL = на все)
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -154,7 +163,22 @@ def active_promo(user_id: int):
     if err:
         ex("DELETE FROM user_promo WHERE user_id=?", (user_id,))
         return None
-    return r["code"], percent
+    p = one("SELECT tag_id FROM promocodes WHERE code=?", (r["code"],))
+    return r["code"], percent, (p["tag_id"] if p else None)
+
+
+def pct_for(pr, tag_id):
+    """Процент скидки промокода pr (из active_promo) для тега tag_id: 0, если промокод на другой тег."""
+    if not pr:
+        return 0
+    if pr[2] is not None and pr[2] != tag_id:
+        return 0
+    return pr[1]
+
+
+def promo_tag(code: str):
+    """Тег, к которому привязан промокод (строка tags), либо None, если промокод на все теги."""
+    return one("SELECT t.* FROM promocodes p JOIN tags t ON t.id=p.tag_id WHERE p.code=?", (code.strip().upper(),))
 
 
 def consume_promo(user_id: int, code: str):
@@ -169,3 +193,24 @@ def apply_discount(price, percent):
     if not percent:
         return price
     return max(1, round(price * (100 - percent) / 100))
+
+
+# ---------- способы оплаты ----------
+# method в таблице orders: card (₽), gold (г), stars (звёзды), boost (бусты)
+METHOD_UNIT = {"card": "₽", "gold": "г", "stars": "⭐", "boost": "🚀"}
+METHOD_NAME = {"card": "карта/СБП", "gold": "голда", "stars": "звёзды", "boost": "бусты"}
+
+
+def money(amount, method):
+    """'1 200 ₽' / '400 г' / '50 ⭐' / '3 🚀'."""
+    return f"{amount:,}".replace(",", " ") + " " + METHOD_UNIT.get(method, "")
+
+
+# ---------- рефералки ----------
+def ref_stats(code):
+    """(переходов, из них новых, оплаченных заказов) по реферальной ссылке."""
+    total = one("SELECT COUNT(*) n FROM ref_visits WHERE code=?", (code,))["n"]
+    new = one("SELECT COUNT(*) n FROM ref_visits WHERE code=? AND is_new=1", (code,))["n"]
+    paid = one("SELECT COUNT(*) n FROM orders o JOIN ref_visits v ON v.user_id=o.user_id "
+               "WHERE v.code=? AND o.status='paid'", (code,))["n"]
+    return total, new, paid

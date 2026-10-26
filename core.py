@@ -1,4 +1,4 @@
-"""Общее ядро бота. Запускай bot.py."""
+"""Общее ядро бота. Запускай не его, а bot_pc.py (с компьютера) или bot_host.py (на хостинге)."""
 import asyncio
 import logging
 import os

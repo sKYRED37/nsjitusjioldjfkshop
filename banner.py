@@ -6,8 +6,21 @@ import os
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE = os.path.join(HERE, "assets", "terms_template.png")
-FONT = os.path.join(HERE, "fonts", "Montserrat.ttf")
+
+
+def find_file(name):
+    """Ищет файл ресурса: рядом с banner.py, в assets/, в fonts/ или в рабочей папке
+    (на хостингах без папок всё лежит в одном каталоге)."""
+    for base in (HERE, os.getcwd(), "/app"):
+        for sub in ("", "assets", "fonts"):
+            p = os.path.join(base, sub, name)
+            if os.path.isfile(p):
+                return p
+    raise FileNotFoundError(f"Не найден файл {name} — загрузи его рядом с bot.py")
+
+
+TEMPLATE_NAME = "terms_template.jpg"
+FONT_NAME = "Montserrat.ttf"
 S = 3  # суперсэмплинг для гладких краёв
 
 BG = (3, 3, 3)
@@ -15,6 +28,7 @@ TRACK = (32, 31, 32)
 RED = (246, 3, 22)
 WHITE = (252, 250, 251)
 GOLD = (255, 206, 84)
+STARS = (255, 236, 150)
 
 # геометрия шаблона (1896x830)
 CHIP_CLEAR = (1338, 122, 1528, 208)      # область, где был текст «TAG»
@@ -34,13 +48,21 @@ _tpl = None
 def font(size, weight):
     key = (size, weight)
     if key not in _cache:
-        f = ImageFont.truetype(FONT, int(size * S))
+        f = ImageFont.truetype(find_file(FONT_NAME), int(size * S))
         try:
             f.set_variation_by_axes([weight])
         except Exception:
             pass
         _cache[key] = f
     return _cache[key]
+
+
+def stars_word(n):
+    """1 Звезда, 2–4 Звезды, 5+ Звёзд."""
+    n = abs(int(n or 0))
+    if n % 100 in (11, 12, 13, 14):
+        return "Звёзд"
+    return {1: "Звезда", 2: "Звезды", 3: "Звезды", 4: "Звезды"}.get(n % 10, "Звёзд")
 
 
 def fmt(n):
@@ -64,7 +86,7 @@ def chamfer(d, box, fill, cut=9):
 def template():
     global _tpl
     if _tpl is None:
-        _tpl = Image.open(TEMPLATE).convert("RGB")
+        _tpl = Image.open(find_file(TEMPLATE_NAME)).convert("RGB")
     return _tpl.copy()
 
 
@@ -102,6 +124,7 @@ def render_terms(tag, rows, highlight=None, **_ignored):
     for i, row in enumerate(rows):
         term, price, closed = row[:3]
         gold = row[3] if len(row) > 3 else None
+        stars = row[4] if len(row) > 4 else None
         cy = top + i * pitch
         hl = (i == highlight) and not closed
         lab = fit(term, 700, fs, TRACK_X0 - LABEL_X - 14)
@@ -114,14 +137,21 @@ def render_terms(tag, rows, highlight=None, **_ignored):
             chamfer(d, (TRACK_X0, cy - track_h / 2, TRACK_X0 + fw, cy + track_h / 2), col)
         maxw = PRICE_RIGHT - TRACK_X1 - 22
         if price and not closed:
+            extra = []  # дополнительные строки под рублями: голда, звёзды
             if gold:
-                rs = min(40, int(pitch * 0.52))
+                extra.append((f"{fmt(gold)} г", 650, GOLD))
+            if stars:
+                extra.append((f"{fmt(stars)} {stars_word(stars)}", 650, STARS))
+            if extra:
+                rs = min(40, int(pitch * 0.52)) if len(extra) == 1 else min(34, int(pitch * 0.36))
+                es = int(rs * 0.7) if len(extra) == 1 else int(rs * 0.66)
                 pf = fit(f"{fmt(price)} ₽", 700, rs, maxw)
-                gf = fit(f"{fmt(gold)} г", 650, int(rs * 0.7), maxw)
-                d.text((PRICE_RIGHT * S, (cy - gf.size / S * 0.55) * S), f"{fmt(price)} ₽", font=pf,
-                       fill=WHITE, anchor="rm")
-                d.text((PRICE_RIGHT * S, (cy + pf.size / S * 0.5) * S), f"{fmt(gold)} г", font=gf,
-                       fill=GOLD, anchor="rm")
+                lines = [(f"{fmt(price)} ₽", pf, WHITE)] + [(tx, fit(tx, w, es, maxw), col) for tx, w, col in extra]
+                sizes = [ln[1].size / S for ln in lines]
+                y = cy - sum(sizes) * 1.06 / 2
+                for (tx, fnt, col), sz in zip(lines, sizes):
+                    d.text((PRICE_RIGHT * S, (y + sz * 0.53) * S), tx, font=fnt, fill=col, anchor="rm")
+                    y += sz * 1.06
             else:
                 pf = fit(f"{fmt(price)} ₽", 700, fs, maxw)
                 d.text((PRICE_RIGHT * S, cy * S), f"{fmt(price)} ₽", font=pf, fill=WHITE, anchor="rm")
@@ -136,7 +166,7 @@ def render_terms(tag, rows, highlight=None, **_ignored):
     return out.getvalue()
 
 
-ID_TEMPLATE = os.path.join(HERE, "assets", "id_template.png")
+ID_TEMPLATE = "id_template.jpg"
 ID_CLEAR = (1336, 168, 1516, 246)   # где был текст «TAG» в чипе
 ID_CENTER = (1426, 206)
 _id_tpl = None
@@ -146,7 +176,7 @@ def render_id(tag, **_ignored):
     """Баннер «Игровой ID» с названием покупаемого тега в чипе → байты JPEG."""
     global _id_tpl
     if _id_tpl is None:
-        _id_tpl = Image.open(ID_TEMPLATE).convert("RGB")
+        _id_tpl = Image.open(find_file(ID_TEMPLATE)).convert("RGB")
     base = _id_tpl.copy()
     W, H = base.size
     ImageDraw.Draw(base).rectangle(ID_CLEAR, fill=BG)
@@ -163,7 +193,7 @@ def render_id(tag, **_ignored):
     return out.getvalue()
 
 
-ORDER_TEMPLATE = os.path.join(HERE, "assets", "order_template.png")
+ORDER_TEMPLATE = "order_template.jpg"
 ORDER_BG = (1, 1, 2)
 _order_tpl = None
 
@@ -172,7 +202,7 @@ def render_order(game_id, tag, term, rub, gold=None, **_ignored):
     """Баннер «Проверь заказ»: ID, тег, срок и итог (рубли и, если есть, голда) → байты JPEG."""
     global _order_tpl
     if _order_tpl is None:
-        _order_tpl = Image.open(ORDER_TEMPLATE).convert("RGB")
+        _order_tpl = Image.open(find_file(ORDER_TEMPLATE)).convert("RGB")
     base = _order_tpl.copy()
     W, H = base.size
     cl = ImageDraw.Draw(base)
@@ -208,8 +238,8 @@ def render_order(game_id, tag, term, rub, gold=None, **_ignored):
     return out.getvalue()
 
 
-PAY_TEMPLATE = os.path.join(HERE, "assets", "pay_template.png")
-EXO = os.path.join(HERE, "fonts", "Exo2.ttf")
+PAY_TEMPLATE = "pay_template.jpg"
+EXO = "Exo2.ttf"
 _pay_tpl = None
 _exo_cache = {}
 
@@ -217,7 +247,7 @@ _exo_cache = {}
 def exo(size, weight=500):
     key = (size, weight)
     if key not in _exo_cache:
-        f = ImageFont.truetype(EXO, int(size * S))
+        f = ImageFont.truetype(find_file(EXO), int(size * S))
         try:
             f.set_variation_by_axes([weight])
         except Exception:
@@ -244,7 +274,7 @@ def render_pay(amount, unit="₽", subtitle=None, **_ignored):
     """Баннер «Оплата заказа»: сумма «К оплате» (₽ или г). subtitle — своя подпись слева (иначе из шаблона)."""
     global _pay_tpl
     if _pay_tpl is None:
-        _pay_tpl = Image.open(PAY_TEMPLATE).convert("RGB")
+        _pay_tpl = Image.open(find_file(PAY_TEMPLATE)).convert("RGB")
     base = _pay_tpl.copy()
     W, H = base.size
     px = base.load()
@@ -273,4 +303,79 @@ def render_pay(amount, unit="₽", subtitle=None, **_ignored):
     base.paste(layer, (0, 0), layer)
     out = io.BytesIO()
     base.save(out, "JPEG", quality=90)
+    return out.getvalue()
+
+
+# ---------------- Баннер «Выбери тэг» (страница раздела каталога) ----------------
+TAGS_TEMPLATE = "tags_template.png"
+# плашки 2 колонки × 4 ряда, порядок слева направо, сверху вниз (как номера 1–8 в шаблоне)
+TAGS_COL_X = (296, 963)            # левый край плашки
+TAGS_PLATE_W = 640
+TAGS_ROW_Y = (273, 406, 534, 663)  # верхний край плашки
+TAGS_PLATE_H = 118
+TAGS_TEXT_DX = (420, 845)          # зона названия внутри плашки (после красного шеврона, до номера)
+TAGS_NUM_DX = (850, 930)           # номер плашки
+TAGS_BG = (3, 3, 3)
+TAGS_PER_PAGE = 8
+_tags_tpl = None
+
+
+def _plate_box(i):
+    col, row = i % 2, i // 2
+    x0, y0 = TAGS_COL_X[col], TAGS_ROW_Y[row]
+    return x0, y0, x0 + TAGS_PLATE_W, y0 + TAGS_PLATE_H
+
+
+def render_tags(names, **_ignored):
+    """Баннер «Выбери тэг»: названия тегов страницы вписываются в плашки по порядку,
+    лишние плашки (с [TAG] и номером) стираются. До 8 тегов → байты JPEG."""
+    global _tags_tpl
+    if _tags_tpl is None:
+        _tags_tpl = Image.open(find_file(TAGS_TEMPLATE)).convert("RGB")
+    base = _tags_tpl.copy()
+    W, H = base.size
+    names = [str(n).strip() for n in names if str(n).strip()][:TAGS_PER_PAGE]
+    cl = ImageDraw.Draw(base)
+    px = base.load()
+    erase = []
+    for i in range(TAGS_PER_PAGE):
+        x0, y0, x1, y1 = _plate_box(i)
+        if i >= len(names):
+            # плашки нет — стираем целиком (с запасом на свечение), фон плавно подмешивается
+            erase.append((x0 - 8, y0 - 6, x1 + 10, y1 + 8))
+        else:
+            cy = (y0 + y1) // 2
+            cl.rectangle((x0 + TAGS_TEXT_DX[0] - 296 + 0, cy - 44, x0 + TAGS_TEXT_DX[1] - 296, cy + 44),
+                         fill=px[x0 + 440 - 296 + 30, cy])
+    if erase:
+        # стираем пустые плашки с мягкими краями, чтобы не было видно прямоугольника
+        mask = Image.new("L", (W, H), 0)
+        md = ImageDraw.Draw(mask)
+        for box in erase:
+            md.rectangle(box, fill=255)
+        mask = mask.filter(ImageFilter.GaussianBlur(7))
+        base.paste(Image.new("RGB", (W, H), TAGS_BG), (0, 0), mask)
+    layer = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for i, raw in enumerate(names):
+        x0, y0, x1, y1 = _plate_box(i)
+        cy = (y0 + y1) / 2 + 2
+        name = raw
+        if name.startswith("[") and name.endswith("]"):
+            name = name[1:-1]
+        name = name.upper()
+        zone0, zone1 = x0 + TAGS_TEXT_DX[0] - 296, x0 + TAGS_TEXT_DX[1] - 296
+        cx = (zone0 + zone1) / 2
+        maxw = zone1 - zone0 - 90  # место под красные скобки
+        f = fit(name, 850, 56, maxw, 22)
+        tw = f.getlength(name) / S
+        d.text((cx * S, cy * S), name, font=f, fill=WHITE, anchor="mm")
+        # красные скобки [ ] по краям названия
+        bf = font(int(f.size / S * 1.05) or 30, 850)
+        d.text(((cx - tw / 2 - 12) * S, cy * S), "[", font=bf, fill=RED, anchor="rm")
+        d.text(((cx + tw / 2 + 12) * S, cy * S), "]", font=bf, fill=RED, anchor="lm")
+    layer = layer.resize((W, H), Image.LANCZOS)
+    base.paste(layer, (0, 0), layer)
+    out = io.BytesIO()
+    base.save(out, "JPEG", quality=92)
     return out.getvalue()

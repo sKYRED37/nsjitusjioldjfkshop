@@ -1,5 +1,6 @@
 import asyncio
 import re
+import secrets
 import time
 
 from aiogram import Router, F, Bot
@@ -27,10 +28,12 @@ class A(StatesGroup):
     tag_new = State()
     prices_new = State()
     promo_new = State()
+    promo_tag = State()
     admin_add = State()
     setting = State()
     broadcast = State()
     reply = State()
+    ref_new = State()
     slots = State()
     banner = State()
     ent_banner = State()
@@ -48,6 +51,8 @@ LINK_SETTINGS = {
     "reviews_url": (links.norm_url, "Пришли ссылку, например https://t.me/my_reviews или @my_reviews. «-» — убрать кнопку."),
     "channel_url": (links.norm_url, "Пришли ссылку, например https://t.me/my_channel или @my_channel. «-» — убрать кнопку."),
     "reviews_chat": (links.norm_chat, "Пришли @канал, ссылку t.me/канал или числовой ID вида -1001234567890. «-» — отключить."),
+    "stars_contact": (links.norm_handle, "Пришли юзернейм: @username. «-» — писать менеджеру."),
+    "boost_contact": (links.norm_handle, "Пришли юзернейм: @username. «-» — писать менеджеру."),
 }
 
 SETTING_NAMES = {
@@ -56,6 +61,8 @@ SETTING_NAMES = {
     "channel_url": "Ссылка на канал (кнопка в «Поддержке»)",
     "payment_details": "Реквизиты для оплаты",
     "reviews_chat": "Канал для отзывов (@канал или -100…ID)",
+    "stars_contact": "⭐ Юз, куда писать при оплате звёздами",
+    "boost_contact": "🚀 Юз, куда писать при оплате бустами",
 }
 
 
@@ -67,7 +74,7 @@ def panel_kb():
         [btn("🗂 Каталог", "adm:catalog"), btn("🎟 Промокоды", "adm:promos")],
         [btn("👤 Пользователи", "adm:users"), btn("👥 Админы", "adm:admins")],
         [btn("✏️ Тексты бота", "adm:tx"), btn("🖼 Баннеры", "adm:banners")],
-        [btn("⚙️ Настройки", "adm:settings")],
+        [btn("⚙️ Настройки", "adm:settings"), btn("🔗 Рефералки", "adm:refs")],
         [btn("📢 Рассылка", "adm:bc"), btn("⭐ Отзывы-канал", "adm:rvchan")],
         [btn("🔧 Режим работ: ВКЛ" if maint else "🔧 Режим работ: выкл", "adm:maint"), btn("💾 Бэкап БД", "adm:backup")],
         [btn("✖️ Закрыть", "adm:close")],
@@ -148,7 +155,7 @@ async def cb_orders(c: CallbackQuery, state: FSMContext):
 async def cb_ol(c: CallbackQuery):
     s = c.data.split(":")[2]
     orders = db.q("SELECT * FROM orders WHERE status=? ORDER BY id DESC LIMIT 20", (s,))
-    rows = [[btn(f"#{o['id']} · {o['tag'].split()[0]} · {o['term']} · {fmt(o['amount'])}{'₽' if o['method'] == 'card' else 'г'}", f"adm:ov:{o['id']}")] for o in orders]
+    rows = [[btn(f"#{o['id']} · {o['tag'].split()[0]} · {o['term']} · {db.money(o['amount'], o['method']).replace(' ', '')}", f"adm:ov:{o['id']}")] for o in orders]
     rows.append(back("adm:orders"))
     await show(c, f"{ST[s]} <b>{ST_NAME[s]}</b> (последние 20)" if orders else "Здесь пока пусто.", kb(rows))
 
@@ -156,7 +163,7 @@ async def cb_ol(c: CallbackQuery):
 def order_card(o):
     text = (f"<b>Заказ #{o['id']}</b> {ST.get(o['status'], '')}\n👤 {('@' + o['username']) if o['username'] else o['user_id']} (<code>{o['user_id']}</code>)\n"
             f"🎮 ID: {esc(o['game_id'])}\n🏷 {esc(o['tag'])} · {esc(o['term'])}\n"
-            f"💵 {fmt(o['amount'])} {'₽' if o['method'] == 'card' else 'г'} ({'карта/СБП' if o['method'] == 'card' else 'голда'})"
+            f"💵 {db.money(o['amount'], o['method'])} ({db.METHOD_NAME.get(o['method'], o['method'])})"
             + (f"\n🎟 {esc(o['promo'])}" if o['promo'] else "")
             + f"\n🕐 {time.strftime('%d.%m.%Y %H:%M', time.localtime(o['created_at']))}")
     rows = []
@@ -206,9 +213,12 @@ async def cb_stats(c: CallbackQuery):
     pend = db.one("SELECT COUNT(*) n FROM orders WHERE status='pending'")["n"]
     rub = db.one("SELECT COALESCE(SUM(amount),0) s FROM orders WHERE status='paid' AND method='card'")["s"]
     gold = db.one("SELECT COALESCE(SUM(amount),0) s FROM orders WHERE status='paid' AND method='gold'")["s"]
+    stars = db.one("SELECT COALESCE(SUM(amount),0) s FROM orders WHERE status='paid' AND method='stars'")["s"]
+    boosts = db.one("SELECT COALESCE(SUM(amount),0) s FROM orders WHERE status='paid' AND method='boost'")["s"]
     promos = db.one("SELECT COALESCE(SUM(used_count),0) s FROM promocodes")["s"]
     text = (f"📊 <b>Статистика</b>\n\n👥 Пользователей: {users}\n📦 Заказов: {tot} (в ожидании: {pend})\n"
-            f"💳 Выручка рублями: {fmt(rub)} ₽\n💰 Выручка голдой: {fmt(gold)} г\n🎟 Использований промокодов: {promos}")
+            f"💳 Выручка рублями: {fmt(rub)} ₽\n💰 Выручка голдой: {fmt(gold)} г\n"
+            f"⭐ Получено звёзд: {fmt(stars)}\n🚀 Получено бустов: {fmt(boosts)}\n🎟 Использований промокодов: {promos}")
     await show(c, text, kb([back()]))
 
 
@@ -299,6 +309,8 @@ async def cb_cat_ok(c: CallbackQuery):
     cid = int(c.data.split(":")[2])
     for row in db.q("SELECT id FROM tags WHERE category_id=?", (cid,)):
         db.ex("DELETE FROM prices WHERE tag_id=?", (row["id"],))
+        db.ex("UPDATE promocodes SET tag_id=NULL WHERE tag_id=?", (row["id"],))
+    db.ex("DELETE FROM page_banners WHERE category_id=?", (cid,))
     db.ex("DELETE FROM tags WHERE category_id=?", (cid,))
     db.ex("DELETE FROM categories WHERE id=?", (cid,))
     await c.answer("Раздел удалён")
@@ -313,18 +325,49 @@ async def cb_tag_add(c: CallbackQuery, state: FSMContext):
     await show(c, "Отправь тег в формате:\n<code>[ТЕГ] | Описание | свободных мест</code>\nместа необязательны. Пример: <code>[MCRW] | Mafiozy Esports | 45</code>", kb([back(f"adm:cat:{cid}")]))
 
 
+PRICE_HELP = ("<code>Срок | цена ₽ | цена голдой | ссылка | зв=50 | буст=3</code>\n"
+              "Всё после цены в рублях необязательно и может идти в любом порядке. Голду пропускай как <code>-</code>. "
+              "<code>зв=</code> — цена в звёздах, <code>буст=</code> — сколько бустов. Пример:\n"
+              "<code>Неделя | 200 | 400 | - | зв=150 | буст=3</code>")
+_STARS = re.compile(r"(?i)^(?:зв\w*|stars?|⭐)\s*[=:]?\s*(\d+)$")
+_BOOST = re.compile(r"(?i)^(?:буст\w*|boosts?|🚀)\s*[=:]?\s*(\d+)$")
+
+
+def parse_price(line):
+    """'Срок | ₽ | голда | ссылка | зв=50 | буст=3' → dict или None (строка не распознана) / строка-ошибка."""
+    parts = [p.strip() for p in line.split("|")]
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    r = dict(term=parts[0], rub=int(parts[1]), gold=int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None,
+             url=None, stars=None, boosts=None)
+    for x in parts[3:]:
+        if x in ("", "-"):
+            continue
+        if m := _STARS.match(x):
+            r["stars"] = int(m.group(1)) or None
+        elif m := _BOOST.match(x):
+            r["boosts"] = int(m.group(1)) or None
+        elif u := links.norm_url(x):
+            r["url"] = u
+        else:
+            return "bad"
+    return r
+
+
 @router.message(A.tag_new, F.text, ~F.text.startswith("/"))
 async def got_tag(m: Message, state: FSMContext):
     d = await state.get_data()
     parts = [p.strip() for p in m.text.split("|")]
+    if not parts[0]:
+        return await m.answer("Название тега не может быть пустым. Отправь ещё раз: НАЗВАНИЕ | описание | места")
     slots = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
     tid = db.ex("INSERT INTO tags(category_id,name,description,slots) VALUES(?,?,?,?)",
                 (d["cid"], parts[0], parts[1] if len(parts) > 1 else "", slots))
     await state.set_state(A.prices_new)
     await state.update_data(tid=tid)
     await m.answer(
-        "Теперь цены — по одной строке:\n<code>Срок | цена ₽ | цена голдой | ссылка на оплату</code>\n"
-        "Голда и ссылка необязательны (ссылка — если оплата идёт через сайт; голду тогда пропусти как <code>-</code>). Пример:\n<code>Неделя | 200 | 400\nМесяц | 550 | - | https://site.ru/pay</code>")
+        "Теперь цены — по одной строке:\n" + PRICE_HELP + "\n"
+        "Ссылка — если оплата идёт через сайт. Ещё примеры:\n<code>Неделя | 200 | 400\nМесяц | 550 | - | https://site.ru/pay</code>")
 
 
 @router.message(A.prices_new, F.text, ~F.text.startswith("/"))
@@ -333,21 +376,20 @@ async def got_prices(m: Message, state: FSMContext):
     n = 0
     bad = []
     for line in m.text.splitlines():
-        parts = [p.strip() for p in line.split("|")]
-        if len(parts) < 2 or not parts[1].isdigit():
+        r = parse_price(line)
+        if r is None:
             continue
-        gold = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-        url = links.norm_url(parts[3]) if len(parts) > 3 and parts[3] not in ("", "-") else None
-        if len(parts) > 3 and parts[3] not in ("", "-") and not url:
+        if r == "bad":
             bad.append(line)
             continue
-        db.ex("INSERT INTO prices(tag_id,term,price_rub,price_gold,url) VALUES(?,?,?,?,?)", (d["tid"], parts[0], int(parts[1]), gold, url))
+        db.ex("INSERT INTO prices(tag_id,term,price_rub,price_gold,url,price_stars,price_boosts) VALUES(?,?,?,?,?,?,?)",
+              (d["tid"], r["term"], r["rub"], r["gold"], r["url"], r["stars"], r["boosts"]))
         n += 1
     if not n:
-        return await m.answer("Не распознал ни одной строки. Формат: <code>Срок | цена | голда</code>")
+        return await m.answer("Не распознал ни одной строки. Формат:\n" + PRICE_HELP)
     await state.clear()
     if bad:
-        await m.answer("⚠️ Эти строки пропущены — некорректная ссылка:\n" + "\n".join(f"<code>{esc(b)}</code>" for b in bad))
+        await m.answer("⚠️ Эти строки пропущены — не понял ссылку или параметр:\n" + "\n".join(f"<code>{esc(b)}</code>" for b in bad))
     await m.answer(f"✅ Добавлено цен: {n}.", reply_markup=kb([[btn("🏷 К тегу", f"adm:tag:{d['tid']}")]]))
 
 
@@ -362,7 +404,7 @@ async def tag_view(c, tid):
     if not t:
         return await c.answer("Нет такого тега", show_alert=True)
     prices = db.q("SELECT * FROM prices WHERE tag_id=? ORDER BY price_rub", (tid,))
-    rows = [[btn(f"{p['term']} — {fmt(p['price_rub'])}₽" + (f" / {fmt(p['price_gold'])}г" if p['price_gold'] else "") + (" 🔗" if p['url'] else "") + (" 🔒" if p['closed'] else ""), f"adm:pr:{p['id']}")] for p in prices]
+    rows = [[btn(f"{p['term']} — {fmt(p['price_rub'])}₽" + (f" / {fmt(p['price_gold'])}г" if p['price_gold'] else "") + (f" / {fmt(p['price_stars'])}⭐" if p['price_stars'] else "") + (f" / {p['price_boosts']}🚀" if p['price_boosts'] else "") + (" 🔗" if p['url'] else "") + (" 🔒" if p['closed'] else ""), f"adm:pr:{p['id']}")] for p in prices]
     rows.append([btn("➕ Добавить цены", f"adm:pr_add:{tid}"), btn("🔢 Места", f"adm:slots:{tid}")])
     rows.append([btn("✏️ Название/описание", f"adm:tag_ed:{tid}"), btn("🖼 Баннер" + (" ✓" if t["banner"] else ""), f"adm:eb:tag:{tid}")])
     rows.append([btn("🔓 Открыть покупку" if t["closed"] else "🔒 Закрыть покупку", f"adm:tag_c:{tid}")])
@@ -377,7 +419,7 @@ async def cb_pr_add(c: CallbackQuery, state: FSMContext):
     tid = int(c.data.split(":")[2])
     await state.set_state(A.prices_new)
     await state.update_data(tid=tid)
-    await show(c, "Отправь цены, по строке:\n<code>Срок | цена ₽ | цена голдой | ссылка на оплату</code>\n(голда и ссылка необязательны, голду можно пропустить как <code>-</code>)", kb([back(f"adm:tag:{tid}")]))
+    await show(c, "Отправь цены, по строке:\n" + PRICE_HELP, kb([back(f"adm:tag:{tid}")]))
 
 
 @router.callback_query(F.data.regexp(r"^adm:pr_del:\d+$"))
@@ -402,6 +444,7 @@ async def cb_tag_ok(c: CallbackQuery):
     tg = db.one("SELECT * FROM tags WHERE id=?", (int(c.data.split(":")[2]),))
     if tg:
         db.ex("DELETE FROM prices WHERE tag_id=?", (tg["id"],))
+        db.ex("UPDATE promocodes SET tag_id=NULL WHERE tag_id=?", (tg["id"],))
         db.ex("DELETE FROM tags WHERE id=?", (tg["id"],))
         await c.answer("Тег удалён")
         await cat_view(c, tg["category_id"])
@@ -414,20 +457,44 @@ async def cb_promos(c: CallbackQuery, state: FSMContext):
     await promos_list(c)
 
 
+def promo_target(p):
+    """Название тега, к которому привязан промокод (None — на все теги)."""
+    if p["tag_id"] is None:
+        return None
+    tg = db.one("SELECT name FROM tags WHERE id=?", (p["tag_id"],))
+    return tg["name"] if tg else "тег удалён"
+
+
+def find_tag(s):
+    """Тег по названию (или #id). Возвращает (строка тега, текст ошибки)."""
+    s = s.strip()
+    if re.fullmatch(r"#\d+", s):
+        tg = db.one("SELECT * FROM tags WHERE id=?", (int(s[1:]),))
+        return (tg, None) if tg else (None, f"Тега с id {s[1:]} нет.")
+    found = db.q("SELECT * FROM tags WHERE LOWER(name)=LOWER(?)", (s,))
+    if not found:
+        return None, f"Тег «{esc(s)}» не найден. Название должно совпадать с названием тега в каталоге."
+    if len(found) > 1:
+        ids = ", ".join(f"#{x['id']}" for x in found)
+        return None, f"Тегов с таким названием несколько ({ids}) — укажи точный: <code>#id</code>."
+    return found[0], None
+
+
 async def promos_list(c):
     rows = []
     for p in db.q("SELECT * FROM promocodes ORDER BY rowid DESC LIMIT 30"):
         lim = p["max_uses"] or "∞"
-        rows.append([btn(f"{'🟢' if p['active'] else '⚪️'} {p['code']} −{p['percent']}% ({p['used_count']}/{lim})", f"adm:promo:{p['code']}")])
+        tg = promo_target(p)
+        rows.append([btn(f"{'🟢' if p['active'] else '⚪️'} {p['code']} −{p['percent']}%{' · ' + tg if tg else ''} ({p['used_count']}/{lim})", f"adm:promo:{p['code']}")])
     rows.append([btn("➕ Создать промокод", "adm:promo_add")])
     rows.append(back())
-    await show(c, "🎟 <b>Промокоды</b>\nСкидка действует на все товары, на одну покупку.", kb(rows))
+    await show(c, "🎟 <b>Промокоды</b>\nСкидка действует на одну покупку — на все товары или на конкретный тег.", kb(rows))
 
 
 @router.callback_query(F.data == "adm:promo_add")
 async def cb_promo_add(c: CallbackQuery, state: FSMContext):
     await state.set_state(A.promo_new)
-    await show(c, "Отправь: <code>КОД | скидка % | лимит использований</code>\nЛимит 0 = без ограничений.\nПример: <code>SALE20 | 20 | 50</code>", kb([back("adm:promos")]))
+    await show(c, "Отправь: <code>КОД | скидка % | лимит использований | тег</code>\nЛимит 0 = без ограничений. Тег — по желанию: без него скидка на все товары.\nПримеры:\n<code>SALE20 | 20 | 50</code> — на все теги\n<code>SALE20 | 20 | 50 | [ANBL]</code> — только на тег [ANBL]\n(если названий тега несколько — укажи <code>#id</code>)", kb([back("adm:promos")]))
 
 
 @router.message(A.promo_new, F.text, ~F.text.startswith("/"))
@@ -438,10 +505,17 @@ async def got_promo(m: Message, state: FSMContext):
     if not re.fullmatch(r"[A-Za-z0-9_-]{2,20}", parts[0]):
         return await m.answer("Код — только латинские буквы, цифры, «-» и «_», 2–20 символов. Пример: <code>SALE20</code>")
     limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-    db.ex("INSERT OR REPLACE INTO promocodes(code,percent,max_uses,used_count,active) VALUES(?,?,?,0,1)",
-          (parts[0].upper(), int(parts[1]), limit))
+    tag = None
+    if len(parts) > 3 and parts[3]:
+        tag, err = find_tag(parts[3])
+        if err:
+            return await m.answer(err)
+    db.ex("INSERT OR REPLACE INTO promocodes(code,percent,max_uses,used_count,active,tag_id) VALUES(?,?,?,0,1,?)",
+          (parts[0].upper(), int(parts[1]), limit, tag["id"] if tag else None))
     await state.clear()
-    await m.answer(f"✅ Промокод <b>{esc(parts[0].upper())}</b> создан: −{parts[1]}%.", reply_markup=kb([[btn("🎟 К промокодам", "adm:promos")]]))
+    await m.answer(f"✅ Промокод <b>{esc(parts[0].upper())}</b> создан: −{parts[1]}% "
+                   + (f"на тег <b>{esc(tag['name'])}</b>." if tag else "на все теги."),
+                   reply_markup=kb([[btn("🎟 К промокодам", "adm:promos")]]))
 
 
 @router.callback_query(F.data.startswith("adm:promo:"))
@@ -453,12 +527,42 @@ async def promo_view(c, code):
     p = db.one("SELECT * FROM promocodes WHERE code=?", (code,))
     if not p:
         return await c.answer("Не найден", show_alert=True)
-    text = (f"🎟 <b>{esc(p['code'])}</b>\nСкидка: {p['percent']}%\nИспользован: {p['used_count']} / {p['max_uses'] or '∞'}\n"
+    tg = promo_target(p)
+    text = (f"🎟 <b>{esc(p['code'])}</b>\nСкидка: {p['percent']}%\nДействует на: {('тег ' + esc(tg)) if tg else 'все теги'}\nИспользован: {p['used_count']} / {p['max_uses'] or '∞'}\n"
             f"Статус: {'включён' if p['active'] else 'выключен'}")
     await show(c, text, kb([
         [btn("🔁 Вкл/выкл", f"adm:promo_t:{code}"), btn("🗑 Удалить", f"adm:promo_d:{code}")],
+        [btn("🏷 Привязать к тегу", f"adm:promo_tg:{code}")] + ([btn("🌐 На все теги", f"adm:promo_all:{code}")] if p["tag_id"] is not None else []),
         back("adm:promos"),
     ]))
+
+
+@router.callback_query(F.data.startswith("adm:promo_tg:"))
+async def cb_promo_tg(c: CallbackQuery, state: FSMContext):
+    code = c.data.split(":", 2)[2]
+    await state.set_state(A.promo_tag)
+    await state.update_data(promo_code=code)
+    await show(c, "Отправь название тега (например <code>[ANBL]</code>) или <code>#id</code>, если названий несколько.", kb([back(f"adm:promo:{code}")]))
+
+
+@router.message(A.promo_tag, F.text, ~F.text.startswith("/"))
+async def got_promo_tag(m: Message, state: FSMContext):
+    code = (await state.get_data()).get("promo_code")
+    tag, err = find_tag(m.text)
+    if err:
+        return await m.answer(err)
+    db.ex("UPDATE promocodes SET tag_id=? WHERE code=?", (tag["id"], code))
+    await state.clear()
+    await m.answer(f"✅ Промокод <b>{esc(code)}</b> теперь действует только на тег <b>{esc(tag['name'])}</b>.",
+                   reply_markup=kb([[btn("🎟 К промокоду", f"adm:promo:{code}")]]))
+
+
+@router.callback_query(F.data.startswith("adm:promo_all:"))
+async def cb_promo_all(c: CallbackQuery):
+    code = c.data.split(":", 2)[2]
+    db.ex("UPDATE promocodes SET tag_id=NULL WHERE code=?", (code,))
+    await c.answer("Теперь на все теги")
+    await promo_view(c, code)
 
 
 @router.callback_query(F.data.startswith("adm:promo_t:"))
@@ -560,7 +664,7 @@ async def got_setting(m: Message, state: FSMContext):
     key = d["key"]
     raw = (m.text or "").strip()
     if key in LINK_SETTINGS:
-        if raw in ("-", "—", "0") and key in ("reviews_url", "channel_url", "reviews_chat"):
+        if raw in ("-", "—", "0") and key in ("reviews_url", "channel_url", "reviews_chat", "stars_contact", "boost_contact"):
             value = ""
         else:
             value = LINK_SETTINGS[key][0](raw)
@@ -767,6 +871,8 @@ async def show_price(c, pid):
     if not p:
         return await c.answer("Не найдено", show_alert=True)
     text = (f"💲 <b>{esc(p['term'])}</b>\nРубли: {fmt(p['price_rub'])}\nГолда: {fmt(p['price_gold']) if p['price_gold'] else '—'}\n"
+            f"⭐ Звёзды: {fmt(p['price_stars']) if p['price_stars'] else '—'}\n"
+            f"🚀 Бусты: {p['price_boosts'] or '—'}\n"
             f"Ссылка на оплату: {esc(p['url']) if p['url'] else '—'}"
             + ("\n🔒 Этот срок закрыт для покупки" if p["closed"] else ""))
     await show(c, text, kb([[btn("🔓 Открыть срок" if p["closed"] else "🔒 Закрыть срок", f"adm:pr_c:{p['id']}")],
@@ -779,21 +885,20 @@ async def cb_pr_ed(c: CallbackQuery, state: FSMContext):
     pid = int(c.data.split(":")[2])
     await state.set_state(A.price_edit)
     await state.update_data(pid=pid)
-    await show(c, "Отправь новую цену одной строкой:\n<code>Срок | цена ₽ | цена голдой | ссылка</code>\n(голда и ссылка необязательны, голду можно пропустить как <code>-</code>)",
+    await show(c, "Отправь новую цену одной строкой (заменяются все поля):\n" + PRICE_HELP,
                kb([back(f"adm:pr:{pid}")]))
 
 
 @router.message(A.price_edit, F.text, ~F.text.startswith("/"))
 async def got_pr_ed(m: Message, state: FSMContext):
     d = await state.get_data()
-    parts = [p.strip() for p in m.text.split("|")]
-    if len(parts) < 2 or not parts[1].isdigit():
-        return await m.answer("Формат: <code>Срок | цена | голда | ссылка</code>")
-    gold = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
-    url = links.norm_url(parts[3]) if len(parts) > 3 and parts[3] not in ("", "-") else None
-    if len(parts) > 3 and parts[3] not in ("", "-") and not url:
-        return await m.answer("❌ Ссылка некорректная. Пример: https://site.ru/pay (или «-», чтобы без ссылки).")
-    db.ex("UPDATE prices SET term=?, price_rub=?, price_gold=?, url=? WHERE id=?", (parts[0], int(parts[1]), gold, url, d["pid"]))
+    r = parse_price(m.text.splitlines()[0] if m.text.strip() else "")
+    if r is None:
+        return await m.answer("Формат:\n" + PRICE_HELP)
+    if r == "bad":
+        return await m.answer("❌ Не понял ссылку или параметр. Ссылка: https://site.ru/pay, звёзды: <code>зв=50</code>, бусты: <code>буст=3</code>.")
+    db.ex("UPDATE prices SET term=?, price_rub=?, price_gold=?, url=?, price_stars=?, price_boosts=? WHERE id=?",
+          (r["term"], r["rub"], r["gold"], r["url"], r["stars"], r["boosts"], d["pid"]))
     await state.clear()
     await m.answer("✅ Цена обновлена.", reply_markup=kb([[btn("💲 К цене", f"adm:pr:{d['pid']}")]]))
 
@@ -861,7 +966,8 @@ async def pb_view(c, cid):
     rows.append(back(f"adm:cat:{cid}"))
     await show(c, f"🖼 <b>Баннеры страниц — {esc(cat['name'])}</b>\n"
                   f"Страниц у покупателя: {n} (по {db.USER_PAGE} тегов). Новая страница появляется сама, "
-                  "когда тегов становится больше. 🖼 — баннер задан; без него показывается баннер раздела.", kb(rows))
+                  "когда тегов становится больше. Баннер «Выбери тэг» собирается автоматически из тегов страницы. "
+                  "🖼 — свой баннер задан вручную (он главнее автоматического); «Убрать баннер» вернёт автоматический.", kb(rows))
 
 
 @router.callback_query(F.data.regexp(r"^adm:pbs:\d+:\d+$"))
@@ -944,6 +1050,75 @@ async def cb_ub(c: CallbackQuery):
     db.ex("UPDATE users SET banned=1-COALESCE(banned,0) WHERE user_id=?", (uid,))
     text, markup = user_card(uid)
     await show(c, text, markup)
+
+
+# ---------------- рефералки ----------------
+@router.callback_query(F.data == "adm:refs")
+async def cb_refs(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rows = []
+    for r in db.q("SELECT * FROM refs ORDER BY created_at DESC LIMIT 40"):
+        total = db.ref_stats(r["code"])[0]
+        rows.append([btn(f"🔗 {r['name']} — {total} перех.", f"adm:ref:{r['code']}")])
+    rows.append([btn("➕ Создать ссылку", "adm:ref_add")])
+    rows.append(back())
+    await show(c, "🔗 <b>Реферальные ссылки</b>\nСоздай ссылку и раздай её — нажми на ссылку в списке, чтобы увидеть, сколько человек по ней перешло.", kb(rows))
+
+
+@router.callback_query(F.data == "adm:ref_add")
+async def cb_ref_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(A.ref_new)
+    await show(c, "Отправь название ссылки (для себя) — например: <code>Канал Васи</code> или <code>Реклама 12.11</code>:",
+               kb([back("adm:refs")]))
+
+
+@router.message(A.ref_new, F.text, ~F.text.startswith("/"))
+async def got_ref(m: Message, state: FSMContext, bot: Bot):
+    name = m.text.strip()[:40]
+    code = secrets.token_hex(4)
+    db.ex("INSERT INTO refs(code,name,created_by,created_at) VALUES(?,?,?,?)", (code, name, m.from_user.id, int(time.time())))
+    await state.clear()
+    me = await bot.me()
+    await m.answer(f"✅ Ссылка «{esc(name)}» создана:\n<code>https://t.me/{me.username}?start=ref_{code}</code>",
+                   reply_markup=kb([[btn("🔗 Открыть", f"adm:ref:{code}")], [btn("🔗 К рефералкам", "adm:refs")]]))
+
+
+async def ref_view(c, code, bot):
+    r = db.one("SELECT * FROM refs WHERE code=?", (code,))
+    if not r:
+        return await c.answer("Ссылка не найдена", show_alert=True)
+    me = await bot.me()
+    total, new, paid = db.ref_stats(code)
+    last = db.q("SELECT v.user_id, v.at, v.is_new, u.username FROM ref_visits v LEFT JOIN users u ON u.user_id=v.user_id "
+                "WHERE v.code=? ORDER BY v.at DESC LIMIT 10", (code,))
+    lines = [f"{time.strftime('%d.%m %H:%M', time.localtime(v['at']))} · "
+             f"{('@' + esc(v['username'])) if v['username'] else v['user_id']}{' 🆕' if v['is_new'] else ''}" for v in last]
+    text = (f"🔗 <b>{esc(r['name'])}</b>\n<code>https://t.me/{me.username}?start=ref_{code}</code>\n\n"
+            f"👥 Перешло по ссылке: <b>{total}</b>\n🆕 Из них новых в боте: {new}\n✅ Выполненных заказов от них: {paid}\n"
+            f"📅 Создана: {time.strftime('%d.%m.%Y', time.localtime(r['created_at']))}"
+            + ("\n\n<b>Последние переходы:</b>\n" + "\n".join(lines) if lines else "\n\nПока никто не переходил."))
+    await show(c, text, kb([[btn("🔄 Обновить", f"adm:ref:{code}"), btn("🗑 Удалить", f"adm:ref_d:{code}")], back("adm:refs")]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:ref:\w+$"))
+async def cb_ref(c: CallbackQuery, bot: Bot):
+    await ref_view(c, c.data.split(":")[2], bot)
+
+
+@router.callback_query(F.data.regexp(r"^adm:ref_d:\w+$"))
+async def cb_ref_d(c: CallbackQuery):
+    code = c.data.split(":")[2]
+    await show(c, "🗑 Удалить реферальную ссылку и статистику по ней? Ссылка перестанет считать переходы.",
+               kb([[btn("Да, удалить", f"adm:ref_ok:{code}")], back(f"adm:ref:{code}")]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:ref_ok:\w+$"))
+async def cb_ref_ok(c: CallbackQuery, state: FSMContext):
+    code = c.data.split(":")[2]
+    db.ex("DELETE FROM ref_visits WHERE code=?", (code,))
+    db.ex("DELETE FROM refs WHERE code=?", (code,))
+    await c.answer("Удалено")
+    await cb_refs(c, state)
 
 
 # ---------------- режим работ / бэкап ----------------
