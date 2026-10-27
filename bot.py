@@ -1,7 +1,7 @@
 """Запуск на хостинге:  python bot.py
 Всё настраивается переменными окружения (в панели хостинга), токен в код не вписывается.
 
-  BOT_TOKEN   8944799493:AAF0kSbeUpvgcCp-eULYle3hveuVVTRsQ8A   обязательно — токен от @BotFather
+  BOT_TOKEN     обязательно — токен от @BotFather
   OWNER_ID         обязательно — ID админов через запятую: 7434679936,8799415431
   DB_PATH          путь к базе на ПОСТОЯННОМ диске, напр. /data/bot.db (иначе база сотрётся при редеплое)
   REVIEWS_CHAT, REVIEWS_URL, CHANNEL_URL, MANAGER, PAYMENT_DETAILS — необязательно (можно менять в /admin)
@@ -48,7 +48,7 @@ def main():
     import core
     cfg = {k: env(k) for k in ("BOT_TOKEN", "OWNER_ID", "REVIEWS_CHAT", "REVIEWS_URL",
                                "CHANNEL_URL", "MANAGER", "PAYMENT_DETAILS")}
-    cfg["BOT_TOKEN"] = cfg["BOT_TOKEN"] or read_token_file()
+    cfg["8944799493:AAF0kSbeUpvgcCp-eULYle3hveuVVTRsQ8A"] = cfg["BOT_TOKEN"] or read_token_file()
     if not cfg["BOT_TOKEN"]:
         sys.exit("Токен не найден: впиши его в файл token.txt (рядом с bot.py) или задай переменную BOT_TOKEN.")
     delay = 5
