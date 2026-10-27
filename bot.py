@@ -16,14 +16,14 @@ import time
 # │ нужно ничего менять (и не используй «найти и заменить» по файлу!).            │
 # │ Если строка пустая — токен берётся из переменной BOT_TOKEN или token.txt.     │
 # └─────────────────────────────────────────────────────────────────────────────┘
-TOKEN = ""
+TOKEN = "8944799493:AAF0kSbeUpvgcCp-eULYle3hveuVVTRsQ8A"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 sys.path.insert(0, HERE)
 
 DEFAULTS = {
-    "OWNER_ID": "7434679936,8799415431",
+    "OWNER_ID": "7434679936,1766395031",
     "REVIEWS_CHAT": "-1003782821891",
     "REVIEWS_URL": "https://t.me/recontrolreviews",
     "CHANNEL_URL": "https://t.me/recontroltags",
