@@ -48,7 +48,7 @@ def main():
     import core
     cfg = {k: env(k) for k in ("BOT_TOKEN", "OWNER_ID", "REVIEWS_CHAT", "REVIEWS_URL",
                                "CHANNEL_URL", "MANAGER", "PAYMENT_DETAILS")}
-    cfg["8944799493:AAF0kSbeUpvgcCp-eULYle3hveuVVTRsQ8A"] = cfg["BOT_TOKEN"] or read_token_file()
+    cfg["8944799493:AAF0kSbeUpvgcCp-eULYle3hveuVVTRsQ8A"] = cfg["8944799493:AAF0kSbeUpvgcCp-eULYle3hveuVVTRsQ8A"] or read_token_file()
     if not cfg["BOT_TOKEN"]:
         sys.exit("Токен не найден: впиши его в файл token.txt (рядом с bot.py) или задай переменную BOT_TOKEN.")
     delay = 5
