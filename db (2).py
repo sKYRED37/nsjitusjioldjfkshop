@@ -1,0 +1,300 @@
+import os
+import sqlite3
+import random
+import time
+
+# Путь к базе: на хостинге можно задать переменной DB_PATH (например /data/bot.db на постоянном диске)
+USER_PAGE = 8  # тегов на странице списка у покупателя
+DB_PATH = os.environ.get("DB_PATH") or "bot.db"
+_dir = os.path.dirname(os.path.abspath(DB_PATH))
+os.makedirs(_dir, exist_ok=True)
+_conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+_conn.row_factory = sqlite3.Row
+try:
+    _conn.execute("PRAGMA journal_mode=WAL")
+except sqlite3.DatabaseError:
+    pass
+
+DEFAULT_SETTINGS = {
+    "coins_percent": "5",  # % монет от суммы оплаты картой/СБП
+    "coins_rate": "1",     # сколько ₽ стоит 1 монета при оплате тега
+    "bonus_min": "5",      # ежедневный бонус: от скольких монет
+    "bonus_max": "100",    # ежедневный бонус: до скольких монет
+    "manager": "@your_manager",
+    "reviews_url": "https://t.me/",
+    "channel_url": "https://t.me/",
+    "reviews_chat": "",
+    "maintenance": "0",
+    "stars_contact": "",   # юзернейм, куда писать при оплате звёздами (пусто = менеджер)
+    "boost_contact": "",   # юзернейм, куда писать при оплате бустами (пусто = менеджер)
+    "payment_details": "Карта: 0000 0000 0000 0000\nПолучатель: Имя Ф.\nСБП: +7 000 000-00-00\n\nВ комментарии к переводу ничего писать не нужно.",
+}
+
+
+def q(sql, args=()):
+    return _conn.execute(sql, args).fetchall()
+
+
+def one(sql, args=()):
+    return _conn.execute(sql, args).fetchone()
+
+
+def ex(sql, args=()):
+    cur = _conn.execute(sql, args)
+    _conn.commit()
+    return cur.lastrowid
+
+
+def init(owner_id: int):
+    _conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS admins(
+            user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at INTEGER);
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY, username TEXT, joined_at INTEGER);
+        CREATE TABLE IF NOT EXISTS categories(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, position INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS tags(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, category_id INTEGER, name TEXT, description TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS prices(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, tag_id INTEGER, term TEXT, price_rub INTEGER, price_gold INTEGER);
+        CREATE TABLE IF NOT EXISTS promocodes(
+            code TEXT PRIMARY KEY, percent INTEGER, max_uses INTEGER DEFAULT 0,
+            used_count INTEGER DEFAULT 0, active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS promo_uses(code TEXT, user_id INTEGER);
+        CREATE TABLE IF NOT EXISTS user_promo(user_id INTEGER PRIMARY KEY, code TEXT);
+        CREATE TABLE IF NOT EXISTS orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, username TEXT, game_id TEXT,
+            tag TEXT, term TEXT, method TEXT, amount INTEGER, promo TEXT,
+            status TEXT DEFAULT 'pending', created_at INTEGER);
+        CREATE TABLE IF NOT EXISTS order_numbers(id INTEGER PRIMARY KEY AUTOINCREMENT);
+        CREATE TABLE IF NOT EXISTS page_banners(category_id INTEGER, page INTEGER, file_id TEXT, PRIMARY KEY(category_id, page));
+        CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS refs(
+            code TEXT PRIMARY KEY, name TEXT, created_by INTEGER, created_at INTEGER);
+        CREATE TABLE IF NOT EXISTS coin_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, delta INTEGER, kind TEXT,
+            tag TEXT, term TEXT, order_id INTEGER, created_at INTEGER);
+        CREATE INDEX IF NOT EXISTS idx_coin_log_user ON coin_log(user_id);
+        CREATE TABLE IF NOT EXISTS bonus_state(user_id INTEGER PRIMARY KEY, last_at INTEGER);
+        CREATE TABLE IF NOT EXISTS ref_visits(
+            code TEXT, user_id INTEGER, is_new INTEGER DEFAULT 0, at INTEGER,
+            PRIMARY KEY(code, user_id));
+        """
+    )
+    for tbl, col in [("tags", "slots INTEGER"), ("prices", "url TEXT"), ("orders", "tag_id INTEGER"),
+                     ("categories", "banner TEXT"), ("tags", "banner TEXT"), ("tags", "hidden INTEGER DEFAULT 0"),
+                     ("orders", "proof TEXT"), ("orders", "reviewed INTEGER DEFAULT 0"), ("users", "banned INTEGER DEFAULT 0"),
+                     ("tags", "closed INTEGER DEFAULT 0"), ("prices", "closed INTEGER DEFAULT 0"),
+                     ("prices", "price_stars INTEGER"), ("prices", "price_boosts INTEGER"),
+                     ("promocodes", "tag_id INTEGER"),
+                     ("prices", "coins INTEGER"), ("orders", "price_id INTEGER")]:  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
+        try:
+            _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
+    for k, v in DEFAULT_SETTINGS.items():
+        _conn.execute("INSERT OR IGNORE INTO settings VALUES(?,?)", (k, v))
+    owners = owner_id if isinstance(owner_id, (list, tuple, set)) else [owner_id]
+    for oid in owners:
+        if oid:
+            _conn.execute(
+                "INSERT OR IGNORE INTO admins VALUES(?,?,?)", (int(oid), int(oid), int(time.time()))
+            )
+    _conn.commit()
+    if not one("SELECT 1 FROM categories"):
+        _seed()
+
+
+def _seed():
+    c1 = ex("INSERT INTO categories(name) VALUES('Киберспортивные теги')")
+    ex("INSERT INTO categories(name) VALUES('Фан-теги')")
+    t = ex("INSERT INTO tags(category_id,name,description,slots) VALUES(?,?,?,?)", (c1, "[ANBL]", "Anable", 45))
+    for term, r, g in [("3 дня", 100, 200), ("Неделя", 200, 400), ("Месяц", 550, 1100), ("Год", 2650, 5300)]:
+        ex("INSERT INTO prices(tag_id,term,price_rub,price_gold) VALUES(?,?,?,?)", (t, term, r, g))
+
+
+def reserve_order_number():
+    """Выдаёт уникальный номер заказа заранее (показывается на экране оплаты)."""
+    return ex("INSERT INTO order_numbers(id) SELECT MAX(COALESCE((SELECT MAX(id) FROM orders),0), "
+              "COALESCE((SELECT MAX(id) FROM order_numbers),0)) + 1")
+
+
+def page_banner(cat_id, page):
+    r = one("SELECT file_id FROM page_banners WHERE category_id=? AND page=?", (cat_id, page))
+    return r["file_id"] if r and r["file_id"] else None
+
+
+def visible_tag_count(cat_id):
+    return one("SELECT COUNT(*) n FROM tags WHERE category_id=? AND hidden=0", (cat_id,))["n"]
+
+
+# ---------- settings / admins ----------
+def get_setting(key):
+    r = one("SELECT value FROM settings WHERE key=?", (key,))
+    return r["value"] if r else DEFAULT_SETTINGS.get(key, "")
+
+
+def set_setting(key, value):
+    ex("INSERT OR REPLACE INTO settings VALUES(?,?)", (key, value))
+
+
+def is_admin(user_id: int) -> bool:
+    return one("SELECT 1 FROM admins WHERE user_id=?", (user_id,)) is not None
+
+
+def admin_ids():
+    return [r["user_id"] for r in q("SELECT user_id FROM admins")]
+
+
+# ---------- promo ----------
+def check_promo(code: str, user_id: int):
+    """Возвращает (percent, error)."""
+    code = code.strip().upper()
+    p = one("SELECT * FROM promocodes WHERE code=?", (code,))
+    if not p or not p["active"]:
+        return None, "none"
+    if p["max_uses"] and p["used_count"] >= p["max_uses"]:
+        return None, "limit"
+    if one("SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, user_id)):
+        return None, "used"
+    return p["percent"], None
+
+
+def activate_promo(user_id: int, code: str):
+    ex("INSERT OR REPLACE INTO user_promo VALUES(?,?)", (user_id, code.strip().upper()))
+
+
+def active_promo(user_id: int):
+    """Активный промокод пользователя (code, percent) или None. Перепроверяет валидность."""
+    r = one("SELECT code FROM user_promo WHERE user_id=?", (user_id,))
+    if not r:
+        return None
+    percent, err = check_promo(r["code"], user_id)
+    if err:
+        ex("DELETE FROM user_promo WHERE user_id=?", (user_id,))
+        return None
+    p = one("SELECT tag_id FROM promocodes WHERE code=?", (r["code"],))
+    return r["code"], percent, (p["tag_id"] if p else None)
+
+
+def pct_for(pr, tag_id):
+    """Процент скидки промокода pr (из active_promo) для тега tag_id: 0, если промокод на другой тег."""
+    if not pr:
+        return 0
+    if pr[2] is not None and pr[2] != tag_id:
+        return 0
+    return pr[1]
+
+
+def promo_tag(code: str):
+    """Тег, к которому привязан промокод (строка tags), либо None, если промокод на все теги."""
+    return one("SELECT t.* FROM promocodes p JOIN tags t ON t.id=p.tag_id WHERE p.code=?", (code.strip().upper(),))
+
+
+def consume_promo(user_id: int, code: str):
+    ex("UPDATE promocodes SET used_count=used_count+1 WHERE code=?", (code,))
+    ex("INSERT INTO promo_uses VALUES(?,?)", (code, user_id))
+    ex("DELETE FROM user_promo WHERE user_id=?", (user_id,))
+
+
+def apply_discount(price, percent):
+    if price is None:
+        return None
+    if not percent:
+        return price
+    return max(1, round(price * (100 - percent) / 100))
+
+
+# ---------- способы оплаты ----------
+# method в таблице orders: card (₽), gold (г), stars (звёзды), boost (бусты)
+METHOD_UNIT = {"card": "₽", "gold": "г", "stars": "⭐", "boost": "🚀", "coins": "🪙"}
+METHOD_NAME = {"card": "карта/СБП", "gold": "голда", "stars": "звёзды", "boost": "бусты", "coins": "монеты"}
+
+
+def money(amount, method):
+    """'1 200 ₽' / '400 г' / '50 ⭐' / '3 🚀'."""
+    return f"{amount:,}".replace(",", " ") + " " + METHOD_UNIT.get(method, "")
+
+
+# ---------- монеты ----------
+def coin_percent():
+    try:
+        return max(0, min(100, int(get_setting("coins_percent") or 0)))
+    except ValueError:
+        return 0
+
+
+def coin_rate():
+    try:
+        return max(1, int(get_setting("coins_rate") or 1))
+    except ValueError:
+        return 1
+
+
+def coin_balance(uid):
+    return one("SELECT COALESCE(SUM(delta),0) s FROM coin_log WHERE user_id=?", (uid,))["s"]
+
+
+def coin_add(uid, delta, kind, tag="", term="", order_id=None):
+    """kind: earn — начисление за заказ, spend — оплата монетами, refund — возврат, admin — ручная правка."""
+    return ex("INSERT INTO coin_log(user_id,delta,kind,tag,term,order_id,created_at) VALUES(?,?,?,?,?,?,?)",
+              (uid, int(delta), kind, tag or "", term or "", order_id, int(time.time())))
+
+
+def coins_for(rub):
+    """Цена в монетах (округление вверх)."""
+    return -(-int(rub) // coin_rate())
+
+
+def coins_earn_for(amount_rub):
+    return int(amount_rub) * coin_percent() // 100
+
+
+def coins_reward(price, paid_rub=None):
+    """Сколько монет дать за покупку: своё число у цены или % от суммы (оплаченной картой — фактической, иначе — от цены)."""
+    if price is not None and price["coins"] is not None:
+        return max(0, int(price["coins"]))
+    base = paid_rub if paid_rub is not None else (price["price_rub"] if price is not None else 0)
+    return coins_earn_for(base or 0)
+
+
+BONUS_HOURS = 24
+
+
+def bonus_range():
+    try:
+        lo, hi = int(get_setting("bonus_min") or 5), int(get_setting("bonus_max") or 100)
+    except ValueError:
+        lo, hi = 5, 100
+    lo = max(1, lo)
+    return lo, max(lo, hi)
+
+
+def bonus_left(uid):
+    """Сколько секунд осталось до следующего бонуса (0 — можно забирать)."""
+    r = one("SELECT last_at FROM bonus_state WHERE user_id=?", (uid,))
+    if not r or not r["last_at"]:
+        return 0
+    return max(0, int(r["last_at"]) + BONUS_HOURS * 3600 - int(time.time()))
+
+
+def bonus_claim(uid):
+    """Выдаёт случайный бонус, если прошло 24 ч. Возвращает число монет или None. Без await внутри — двойной тап не страшен."""
+    if bonus_left(uid) > 0:
+        return None
+    lo, hi = bonus_range()
+    n = random.randint(lo, hi)
+    ex("INSERT OR REPLACE INTO bonus_state(user_id,last_at) VALUES(?,?)", (uid, int(time.time())))
+    coin_add(uid, n, "bonus")
+    return n
+
+
+# ---------- рефералки ----------
+def ref_stats(code):
+    """(переходов, из них новых, оплаченных заказов) по реферальной ссылке."""
+    total = one("SELECT COUNT(*) n FROM ref_visits WHERE code=?", (code,))["n"]
+    new = one("SELECT COUNT(*) n FROM ref_visits WHERE code=? AND is_new=1", (code,))["n"]
+    paid = one("SELECT COUNT(*) n FROM orders o JOIN ref_visits v ON v.user_id=o.user_id "
+               "WHERE v.code=? AND o.status='paid'", (code,))["n"]
+    return total, new, paid
