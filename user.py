@@ -289,11 +289,11 @@ async def make_tags_banner(names):
     return key, await asyncio.to_thread(banner.render_tags, names=names)
 
 
-async def make_terms_banner(tag_name, banner_rows):
+async def make_terms_banner(tag_name, banner_rows, unit="₽"):
     """Баннер «Выбери срок» под тег: название, сроки и цены (с учётом промокода)."""
     names = [r[0].lower() for r in banner_rows]
     hl = names.index("месяц") if "месяц" in names else (1 if len(banner_rows) >= 2 else None)
-    args = dict(tag=tag_name, rows=banner_rows, highlight=hl)
+    args = dict(tag=tag_name, rows=banner_rows, highlight=hl, unit=unit)
     key = hashlib.sha1(repr(sorted(args.items(), key=lambda kv: kv[0])).encode()).hexdigest()
     if key in _banner_ids:
         return key, b""
@@ -324,8 +324,10 @@ async def cb_tag(c: CallbackQuery, state: FSMContext):
     await render_tag(c, state, int(c.data.split(":")[1]))
 
 
-async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=None):
+async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=None, coins_mode=False):
     await state.clear()
+    if coins_mode:  # покупка через «Магазин COINS»: везде только цены в койнах
+        await state.update_data(coins_only=True)
     tag = db.one("SELECT * FROM tags WHERE id=? AND hidden=0", (tid,))
     if not tag:
         return await c.answer(t("txt_tag_nf"), show_alert=True)
@@ -345,6 +347,11 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
             banner_rows.append((p["term"], None, True))
             rows.append([btn(f"🔒 {p['term']}", f"closed:{p['id']}")])
             continue
+        if coins_mode:
+            n_coins = db.coins_for(db.apply_discount(p["price_rub"], pct))
+            banner_rows.append((p["term"], n_coins, False))
+            rows.append([btn(f"{p['term']} | {fmt(n_coins)} 🪙", f"price:{p['id']}")])
+            continue
         purl = links.norm_url(p["url"])
         if purl:
             site = True
@@ -357,7 +364,7 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
         banner_rows.append((p["term"], rub, False, gold, stars))
         label = f"{p['term']} | {fmt(rub)}₽" + (f" / {fmt(gold)}г" if gold else "") + (f" / {fmt(stars)}⭐" if stars else "")
         rows.append([btn(label, f"price:{p['id']}")])
-    if manager_url():
+    if manager_url() and not coins_mode:
         rows.append([btn(t("btn_contact"), url=manager_url())])
     rows.append([btn(t("btn_back"), back_data or f"cat:{tag['category_id']}:0")])
     text = t("txt_tag_head", name=esc(tag["name"]), desc=esc(tag["description"]))
@@ -373,10 +380,12 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
         text += "\n\n" + t("txt_choose_term")
     if pct and not site:
         text += "\n\n" + t("txt_promo_active", code=esc(pr[0]), pct=pct)
+    if coins_mode:
+        text += "\n\n" + t("txt_coins_tag_balance", balance=fmt(db.coin_balance(c.from_user.id)))
     gen = None
     if not tag["banner"] and banner_rows:
         try:
-            gen = await make_terms_banner(tag["name"], banner_rows)
+            gen = await make_terms_banner(tag["name"], banner_rows, "COINS" if coins_mode else "₽")
         except Exception:
             logging.exception("Не удалось создать баннер сроков")
     await show(c, text, kb(rows), "terms", fid=tag["banner"] or (None if gen else (tcat["banner"] if tcat else None)),
@@ -418,10 +427,11 @@ async def cb_price(c: CallbackQuery, state: FSMContext):
         return await summary(c, state)
     await state.set_state(Order.game_id)
     p = db.one("SELECT tag_id FROM prices WHERE id=?", (pid,))
+    other = f"ctag:{p['tag_id']}" if data.get("coins_only") else f"tag:{p['tag_id']}"
     await show(
         c,
         t("txt_enter_id"),
-        kb([[btn(t("btn_other_term"), f"tag:{p['tag_id']}")]]),
+        kb([[btn(t("btn_other_term"), other)]]),
         "game_id",
         gen=await id_gen(pid),
     )
@@ -499,6 +509,19 @@ def format_details(raw):
     return "\n".join(out)
 
 
+async def summary_coins(target, state, data, p, pr, rub, user_id, lines):
+    """Сводка заказа из «Магазина COINS»: только цена и оплата койнами."""
+    coins = db.coins_for(rub)
+    if pr:
+        lines.append(t("txt_order_promo", code=esc(pr[0]), pct=pr[1]))
+    lines.append(t("txt_order_coins", price=fmt(coins), balance=fmt(db.coin_balance(user_id))))
+    lines.append("\n" + t("txt_order_choose_pay"))
+    rows = [[btn(t("btn_pay_coins", price=fmt(coins)), "pay:coins")],
+            [btn(t("btn_other_term"), f"tag:{p['tag_id']}_keep"), btn(t("btn_other_id"), "order:chid")],
+            [btn(t("btn_coins_menu"), "menu:main")]]
+    await show(target, "\n".join(lines), kb(rows), "order")
+
+
 async def summary(target, state: FSMContext):
     data = await state.get_data()
     user_id = target.from_user.id
@@ -514,6 +537,8 @@ async def summary(target, state: FSMContext):
         t("txt_order_tag", tag=f"{esc(p['tname'])} {esc(p['tdesc'])}".strip()),
         t("txt_order_term", term=esc(p["term"])),
     ]
+    if data.get("coins_only"):
+        return await summary_coins(target, state, data, p, pr, rub, user_id, lines)
     if pr:
         lines.append(t("txt_order_promo", code=esc(pr[0]), pct=pr[1]))
         lines.append(t("txt_order_card", price=f"<s>{fmt(p['price_rub'])}</s> <b>{fmt(rub)} ₽</b>"))
@@ -559,9 +584,12 @@ async def cb_tag_keep(c: CallbackQuery, state: FSMContext):
     tid = int(c.data.split(":")[1].split("_")[0])
     data = await state.get_data()
     gid = data.get("game_id")
+    coins_only = bool(data.get("coins_only"))
     await state.clear()
     if gid:
         await state.update_data(game_id=gid)
+    if coins_only:
+        await state.update_data(coins_only=True)
     tag = db.one("SELECT * FROM tags WHERE id=?", (tid,))
     prices = db.q("SELECT * FROM prices WHERE tag_id=? ORDER BY price_rub", (tid,))
     pr = db.active_promo(c.from_user.id)
@@ -575,6 +603,9 @@ async def cb_tag_keep(c: CallbackQuery, state: FSMContext):
             continue
         rub = db.apply_discount(p["price_rub"], pct)
         gold = db.apply_discount(p["price_gold"], pct)
+        if coins_only:
+            rows.append([btn(f"{p['term']} | {fmt(db.coins_for(rub))} 🪙", f"price:{p['id']}")])
+            continue
         rows.append([btn(f"{p['term']} | {fmt(rub)}₽" + (f" / {fmt(gold)}г" if gold else ""), f"price:{p['id']}")])
     rows.append([btn(t("btn_menu"), "menu:main")])
     await show(c, t("txt_choose_new_term", name=esc(tag["name"])) + (("\n\n" + t("txt_closed")) if tag["closed"] else ""), kb(rows))
@@ -830,7 +861,7 @@ async def cb_coins_buy(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.regexp(r"^ctag:\d+$"))
 async def cb_coins_tag(c: CallbackQuery, state: FSMContext):
-    await render_tag(c, state, int(c.data.split(":")[1]), back_data="coins:buy:0")
+    await render_tag(c, state, int(c.data.split(":")[1]), back_data="coins:buy:0", coins_mode=True)
 
 
 @router.callback_query(F.data == "coins:hist")

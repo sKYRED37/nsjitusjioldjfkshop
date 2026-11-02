@@ -90,7 +90,7 @@ def template():
     return _tpl.copy()
 
 
-def render_terms(tag, rows, highlight=None, **_ignored):
+def render_terms(tag, rows, highlight=None, unit="₽", **_ignored):
     """rows: [(срок, цена_в_рублях | None, закрыт_ли)] → байты JPEG."""
     base = template()
     W, H = base.size
@@ -145,16 +145,16 @@ def render_terms(tag, rows, highlight=None, **_ignored):
             if extra:
                 rs = min(40, int(pitch * 0.52)) if len(extra) == 1 else min(34, int(pitch * 0.36))
                 es = int(rs * 0.7) if len(extra) == 1 else int(rs * 0.66)
-                pf = fit(f"{fmt(price)} ₽", 700, rs, maxw)
-                lines = [(f"{fmt(price)} ₽", pf, WHITE)] + [(tx, fit(tx, w, es, maxw), col) for tx, w, col in extra]
+                pf = fit(f"{fmt(price)} {unit}", 700, rs, maxw)
+                lines = [(f"{fmt(price)} {unit}", pf, WHITE)] + [(tx, fit(tx, w, es, maxw), col) for tx, w, col in extra]
                 sizes = [ln[1].size / S for ln in lines]
                 y = cy - sum(sizes) * 1.06 / 2
                 for (tx, fnt, col), sz in zip(lines, sizes):
                     d.text((PRICE_RIGHT * S, (y + sz * 0.53) * S), tx, font=fnt, fill=col, anchor="rm")
                     y += sz * 1.06
             else:
-                pf = fit(f"{fmt(price)} ₽", 700, fs, maxw)
-                d.text((PRICE_RIGHT * S, cy * S), f"{fmt(price)} ₽", font=pf, fill=WHITE, anchor="rm")
+                pf = fit(f"{fmt(price)} {unit}", 700, fs, maxw)
+                d.text((PRICE_RIGHT * S, cy * S), f"{fmt(price)} {unit}", font=pf, fill=WHITE, anchor="rm")
         else:
             pf = fit("закрыто", 700, fs, maxw)
             d.text((PRICE_RIGHT * S, cy * S), "закрыто", font=pf, fill=(130, 130, 130), anchor="rm")

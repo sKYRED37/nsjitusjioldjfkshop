@@ -380,23 +380,25 @@ async def cb_adm_coins(c: CallbackQuery, state: FSMContext):
     holders = db.one("SELECT COUNT(*) n FROM (SELECT user_id FROM coin_log GROUP BY user_id HAVING SUM(delta)>0)")["n"]
     text = (f"🪙 <b>Монеты</b>\n\nНачисление за покупку: <b>{db.coin_percent()}%</b> от цены (после подтверждения заказа, любой способ оплаты, кроме монет). "
             f"Своё число монет на цену: тег → цена → «🪙 Монеты за покупку».\nКурс: 1 монета = <b>{db.coin_rate()} ₽</b> при оплате тега монетами\n\n"
-            f"🎁 Ежедневный бонус: от <b>{db.bonus_range()[0]}</b> до <b>{db.bonus_range()[1]}</b> монет раз в 24 ч\n\n"
+            f"🎁 Ежедневный бонус: от <b>{db.bonus_range()[0]}</b> до <b>{db.bonus_range()[1]}</b> монет раз в 24 ч, редкость крупных: <b>{db.bonus_curve()}</b>/10\n\n"
             f"В обороте: <b>{fmt(total)}</b> 🪙 у {holders} чел.")
     await show(c, text, kb([
         [btn("✏️ % начисления", "adm:coins_set:pct"), btn("✏️ Курс (₽ за монету)", "adm:coins_set:rate")],
         [btn("🎁 Бонус: мин", "adm:coins_set:bmin"), btn("🎁 Бонус: макс", "adm:coins_set:bmax")],
+        [btn("🎲 Бонус: редкость крупных", "adm:coins_set:bcurve")],
         [btn("🎁 Выдать / списать монеты", "adm:coins_grant")],
         back(),
     ]))
 
 
-@router.callback_query(F.data.regexp(r"^adm:coins_set:(pct|rate|bmin|bmax)$"))
+@router.callback_query(F.data.regexp(r"^adm:coins_set:(pct|rate|bmin|bmax|bcurve)$"))
 async def cb_coins_set(c: CallbackQuery, state: FSMContext):
     key = c.data.split(":")[2]
     await state.set_state(A.coins_set)
     await state.update_data(key=key)
     ask = {"pct": "Пришли процент начисления (0–100).", "rate": "Пришли, сколько ₽ стоит 1 монета (целое число от 1).",
-           "bmin": "Пришли минимум ежедневного бонуса (целое число от 1).", "bmax": "Пришли максимум ежедневного бонуса (целое число от 1)."}
+           "bmin": "Пришли минимум ежедневного бонуса (целое число от 1).", "bmax": "Пришли максимум ежедневного бонуса (целое число от 1).",
+           "bcurve": "Пришли редкость крупных наград от 1 до 10: 1 — все суммы равновероятны, 3 — по умолчанию, 6+ — крупные выпадают очень редко."}
     await show(c, ask[key], kb([back("adm:coins")]))
 
 
@@ -404,9 +406,10 @@ async def cb_coins_set(c: CallbackQuery, state: FSMContext):
 async def got_coins_set(m: Message, state: FSMContext):
     d = await state.get_data()
     raw = m.text.strip().replace("%", "")
-    if not raw.isdigit() or (d["key"] == "pct" and int(raw) > 100) or (d["key"] != "pct" and int(raw) < 1):
-        return await m.answer("Нужно целое число" + (" от 0 до 100." if d["key"] == "pct" else " от 1."))
-    db.set_setting({"pct": "coins_percent", "rate": "coins_rate", "bmin": "bonus_min", "bmax": "bonus_max"}[d["key"]], str(int(raw)))
+    if not raw.isdigit() or (d["key"] == "pct" and int(raw) > 100) or (d["key"] != "pct" and int(raw) < 1) \
+            or (d["key"] == "bcurve" and int(raw) > 10):
+        return await m.answer("Нужно целое число" + {"pct": " от 0 до 100.", "bcurve": " от 1 до 10."}.get(d["key"], " от 1."))
+    db.set_setting({"pct": "coins_percent", "rate": "coins_rate", "bmin": "bonus_min", "bmax": "bonus_max", "bcurve": "bonus_curve"}[d["key"]], str(int(raw)))
     await state.clear()
     await m.answer("✅ Сохранено.", reply_markup=kb([[btn("🪙 К монетам", "adm:coins")]]))
 

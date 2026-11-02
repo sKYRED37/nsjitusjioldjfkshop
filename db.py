@@ -20,6 +20,7 @@ DEFAULT_SETTINGS = {
     "coins_rate": "1",     # сколько ₽ стоит 1 монета при оплате тега
     "bonus_min": "5",      # ежедневный бонус: от скольких монет
     "bonus_max": "100",    # ежедневный бонус: до скольких монет
+    "bonus_curve": "3",    # редкость больших наград: 1 — все суммы равновероятны, чем больше — тем реже крупные
     "manager": "@your_manager",
     "reviews_url": "https://t.me/",
     "channel_url": "https://t.me/",
@@ -271,6 +272,20 @@ def bonus_range():
     return lo, max(lo, hi)
 
 
+def bonus_curve():
+    try:
+        return max(1, min(10, int(get_setting("bonus_curve") or 3)))
+    except ValueError:
+        return 3
+
+
+def bonus_roll():
+    """Случайная награда: маленькие суммы выпадают часто, большие — редко (чем выше bonus_curve, тем реже крупные)."""
+    lo, hi = bonus_range()
+    n = lo + int((hi - lo + 1) * random.random() ** bonus_curve())
+    return min(n, hi)
+
+
 def bonus_left(uid):
     """Сколько секунд осталось до следующего бонуса (0 — можно забирать)."""
     r = one("SELECT last_at FROM bonus_state WHERE user_id=?", (uid,))
@@ -283,8 +298,7 @@ def bonus_claim(uid):
     """Выдаёт случайный бонус, если прошло 24 ч. Возвращает число монет или None. Без await внутри — двойной тап не страшен."""
     if bonus_left(uid) > 0:
         return None
-    lo, hi = bonus_range()
-    n = random.randint(lo, hi)
+    n = bonus_roll()
     ex("INSERT OR REPLACE INTO bonus_state(user_id,last_at) VALUES(?,?)", (uid, int(time.time())))
     coin_add(uid, n, "bonus")
     return n
