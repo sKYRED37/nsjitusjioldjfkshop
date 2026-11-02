@@ -379,24 +379,25 @@ async def cb_adm_coins(c: CallbackQuery, state: FSMContext):
     total = db.one("SELECT COALESCE(SUM(delta),0) s FROM coin_log")["s"]
     holders = db.one("SELECT COUNT(*) n FROM (SELECT user_id FROM coin_log GROUP BY user_id HAVING SUM(delta)>0)")["n"]
     text = (f"🪙 <b>Монеты</b>\n\nНачисление за покупку: <b>{db.coin_percent()}%</b> от цены (после подтверждения заказа, любой способ оплаты, кроме монет). "
-            f"Своё число монет на цену: тег → цена → «🪙 Монеты за покупку».\nКурс: 1 монета = <b>{db.coin_rate()} ₽</b> при оплате тега монетами\n\n"
+            f"Своё число монет на цену: тег → цена → «🪙 Монеты за покупку».\nЦена тега в койнах: цена в ₽ × <b>{db.coin_mult()}</b>\n\n"
             f"🎁 Ежедневный бонус: от <b>{db.bonus_range()[0]}</b> до <b>{db.bonus_range()[1]}</b> монет раз в 24 ч, редкость крупных: <b>{db.bonus_curve()}</b>/10\n\n"
             f"В обороте: <b>{fmt(total)}</b> 🪙 у {holders} чел.")
     await show(c, text, kb([
-        [btn("✏️ % начисления", "adm:coins_set:pct"), btn("✏️ Курс (₽ за монету)", "adm:coins_set:rate")],
+        [btn("✏️ % начисления", "adm:coins_set:pct"), btn("✏️ Цена в койнах (×)", "adm:coins_set:mult")],
         [btn("🎁 Бонус: мин", "adm:coins_set:bmin"), btn("🎁 Бонус: макс", "adm:coins_set:bmax")],
         [btn("🎲 Бонус: редкость крупных", "adm:coins_set:bcurve")],
+        [btn("🏷 Теги в магазине COINS", "adm:cshop:0")],
         [btn("🎁 Выдать / списать монеты", "adm:coins_grant")],
         back(),
     ]))
 
 
-@router.callback_query(F.data.regexp(r"^adm:coins_set:(pct|rate|bmin|bmax|bcurve)$"))
+@router.callback_query(F.data.regexp(r"^adm:coins_set:(pct|mult|bmin|bmax|bcurve)$"))
 async def cb_coins_set(c: CallbackQuery, state: FSMContext):
     key = c.data.split(":")[2]
     await state.set_state(A.coins_set)
     await state.update_data(key=key)
-    ask = {"pct": "Пришли процент начисления (0–100).", "rate": "Пришли, сколько ₽ стоит 1 монета (целое число от 1).",
+    ask = {"pct": "Пришли процент начисления (0–100).", "mult": "Пришли множитель цены в койнах: цена в койнах = цена в ₽ × это число (целое от 1, сейчас ×" + str(db.coin_mult()) + ").",
            "bmin": "Пришли минимум ежедневного бонуса (целое число от 1).", "bmax": "Пришли максимум ежедневного бонуса (целое число от 1).",
            "bcurve": "Пришли редкость крупных наград от 1 до 10: 1 — все суммы равновероятны, 3 — по умолчанию, 6+ — крупные выпадают очень редко."}
     await show(c, ask[key], kb([back("adm:coins")]))
@@ -409,7 +410,7 @@ async def got_coins_set(m: Message, state: FSMContext):
     if not raw.isdigit() or (d["key"] == "pct" and int(raw) > 100) or (d["key"] != "pct" and int(raw) < 1) \
             or (d["key"] == "bcurve" and int(raw) > 10):
         return await m.answer("Нужно целое число" + {"pct": " от 0 до 100.", "bcurve": " от 1 до 10."}.get(d["key"], " от 1."))
-    db.set_setting({"pct": "coins_percent", "rate": "coins_rate", "bmin": "bonus_min", "bmax": "bonus_max", "bcurve": "bonus_curve"}[d["key"]], str(int(raw)))
+    db.set_setting({"pct": "coins_percent", "mult": "coins_mult", "bmin": "bonus_min", "bmax": "bonus_max", "bcurve": "bonus_curve"}[d["key"]], str(int(raw)))
     await state.clear()
     await m.answer("✅ Сохранено.", reply_markup=kb([[btn("🪙 К монетам", "adm:coins")]]))
 
@@ -610,9 +611,10 @@ async def tag_view(c, tid):
     rows.append([btn("✏️ Название/описание", f"adm:tag_ed:{tid}"), btn("🖼 Баннер" + (" ✓" if t["banner"] else ""), f"adm:eb:tag:{tid}")])
     rows.append([btn("🔓 Открыть покупку" if t["closed"] else "🔒 Закрыть покупку", f"adm:tag_c:{tid}")])
     rows.append([btn("👁 Показать пользователям" if t["hidden"] else "🙈 Скрыть от пользователей", f"adm:tag_h:{tid}")])
+    rows.append([btn("🪙 Вернуть в магазин COINS" if t["coin_hidden"] else "🪙 Убрать из магазина COINS", f"adm:tag_ch:{tid}")])
     rows.append([btn("🗑 Удалить тег", f"adm:tag_del:{tid}")])
     rows.append(back(f"adm:cat:{t['category_id']}"))
-    await show(c, f"🏷 <b>{esc(t['name'])}</b> {esc(t['description'])}\nСвободных мест: {t['slots'] if t['slots'] is not None else '∞'}\n{'🔒 Покупка закрыта (тег виден, купить нельзя)' + chr(10) if t['closed'] else ''}{'🙈 Скрыт от пользователей' + chr(10) if t['hidden'] else ''}Нажми на цену, чтобы изменить или удалить её.", kb(rows))
+    await show(c, f"🏷 <b>{esc(t['name'])}</b> {esc(t['description'])}\nСвободных мест: {t['slots'] if t['slots'] is not None else '∞'}\n{'🔒 Покупка закрыта (тег виден, купить нельзя)' + chr(10) if t['closed'] else ''}{'🙈 Скрыт от пользователей' + chr(10) if t['hidden'] else ''}{'🪙 Убран из магазина COINS (в каталоге виден)' + chr(10) if t['coin_hidden'] else ''}Нажми на цену, чтобы изменить или удалить её.", kb(rows))
 
 
 @router.callback_query(F.data.regexp(r"^adm:pr_add:\d+$"))
@@ -1051,6 +1053,53 @@ async def cb_pr_c(c: CallbackQuery, state: FSMContext):
     r = db.one("SELECT closed FROM prices WHERE id=?", (pid,))
     await c.answer("🔒 Срок закрыт" if r and r["closed"] else "🔓 Срок открыт")
     await show_price(c, pid)
+
+
+@router.callback_query(F.data.regexp(r"^adm:tag_ch:\d+$"))
+async def cb_tag_ch(c: CallbackQuery):
+    tid = int(c.data.split(":")[2])
+    db.ex("UPDATE tags SET coin_hidden=1-COALESCE(coin_hidden,0) WHERE id=?", (tid,))
+    await tag_view(c, tid)
+
+
+CSHOP_PAGE = 20
+
+
+@router.callback_query(F.data.regexp(r"^adm:cshop:\d+$"))
+async def cb_cshop(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cshop_view(c, int(c.data.split(":")[2]))
+
+
+async def cshop_view(c, page):
+    tags = db.q("SELECT t.* FROM tags t JOIN categories g ON g.id=t.category_id ORDER BY g.position, g.id, t.id")
+    pages = max(1, (len(tags) + CSHOP_PAGE - 1) // CSHOP_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = tags[page * CSHOP_PAGE:(page + 1) * CSHOP_PAGE]
+    rows = [[btn(("🚫 " if tg["coin_hidden"] else "✅ ") + ("🙈 " if tg["hidden"] else "") + tg["name"], f"adm:cshop_t:{tg['id']}:{page}")]
+            for tg in chunk]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("◀️", f"adm:cshop:{page - 1}"))
+        if page < pages - 1:
+            nav.append(btn("▶️", f"adm:cshop:{page + 1}"))
+        rows.append(nav)
+    rows.append(back("adm:coins"))
+    shown = sum(1 for tg in tags if not tg["coin_hidden"] and not tg["hidden"])
+    text = (f"🏷 <b>Теги в магазине COINS</b>\n\n✅ — продаётся за койны, 🚫 — убран из магазина (в обычном каталоге остаётся). "
+            f"Нажми на тег, чтобы переключить.\nВидно покупателям в магазине: <b>{shown}</b> из {len(tags)}"
+            + ("\n🙈 — тег целиком скрыт от пользователей." if any(tg["hidden"] for tg in tags) else ""))
+    if not tags:
+        text = "Тегов пока нет."
+    await show(c, text, kb(rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm:cshop_t:\d+:\d+$"))
+async def cb_cshop_t(c: CallbackQuery):
+    _, _, _, tid, page = c.data.split(":")
+    db.ex("UPDATE tags SET coin_hidden=1-COALESCE(coin_hidden,0) WHERE id=?", (int(tid),))
+    await cshop_view(c, int(page))
 
 
 @router.callback_query(F.data.regexp(r"^adm:tag_h:\d+$"))

@@ -17,7 +17,7 @@ except sqlite3.DatabaseError:
 
 DEFAULT_SETTINGS = {
     "coins_percent": "5",  # % монет от суммы оплаты картой/СБП
-    "coins_rate": "1",     # сколько ₽ стоит 1 монета при оплате тега
+    "coins_mult": "3",     # цена тега в койнах = цена в ₽ × это число
     "bonus_min": "5",      # ежедневный бонус: от скольких монет
     "bonus_max": "100",    # ежедневный бонус: до скольких монет
     "bonus_curve": "3",    # редкость больших наград: 1 — все суммы равновероятны, чем больше — тем реже крупные
@@ -89,7 +89,8 @@ def init(owner_id: int):
                      ("tags", "closed INTEGER DEFAULT 0"), ("prices", "closed INTEGER DEFAULT 0"),
                      ("prices", "price_stars INTEGER"), ("prices", "price_boosts INTEGER"),
                      ("promocodes", "tag_id INTEGER"),
-                     ("prices", "coins INTEGER"), ("orders", "price_id INTEGER")]:  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
+                     ("prices", "coins INTEGER"), ("orders", "price_id INTEGER"),
+                     ("tags", "coin_hidden INTEGER DEFAULT 0")]:  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -226,11 +227,11 @@ def coin_percent():
         return 0
 
 
-def coin_rate():
+def coin_mult():
     try:
-        return max(1, int(get_setting("coins_rate") or 1))
+        return max(1, int(get_setting("coins_mult") or 3))
     except ValueError:
-        return 1
+        return 3
 
 
 def coin_balance(uid):
@@ -244,8 +245,8 @@ def coin_add(uid, delta, kind, tag="", term="", order_id=None):
 
 
 def coins_for(rub):
-    """Цена в монетах (округление вверх)."""
-    return -(-int(rub) // coin_rate())
+    """Цена в койнах = цена в рублях × множитель (по умолчанию ×3)."""
+    return int(rub) * coin_mult()
 
 
 def coins_earn_for(amount_rub):

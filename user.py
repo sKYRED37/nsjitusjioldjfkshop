@@ -814,7 +814,7 @@ COIN_WORDS = {"earn": "начислено", "spend": "потрачено", "refu
 @router.callback_query(F.data == "menu:coins")
 async def cb_coins(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    text = t("txt_coins_shop", balance=fmt(db.coin_balance(c.from_user.id)), percent=db.coin_percent(), rate=db.coin_rate())
+    text = t("txt_coins_shop", balance=fmt(db.coin_balance(c.from_user.id)), percent=db.coin_percent(), mult=db.coin_mult())
     await show(c, text, kb([
         [btn(t("btn_coins_buy"), "coins:buy:0")],
         [btn(t("btn_coins_hist"), "coins:hist")],
@@ -826,7 +826,7 @@ async def cb_coins(c: CallbackQuery, state: FSMContext):
 async def cb_coins_buy(c: CallbackQuery, state: FSMContext):
     await state.clear()
     page = int(c.data.split(":")[2])
-    tags = db.q("SELECT t.* FROM tags t JOIN categories c ON c.id=t.category_id WHERE t.hidden=0 "
+    tags = db.q("SELECT t.* FROM tags t JOIN categories c ON c.id=t.category_id WHERE t.hidden=0 AND COALESCE(t.coin_hidden,0)=0 "
                 "ORDER BY c.position, c.id, t.id")
     pages = max(1, (len(tags) + PAGE - 1) // PAGE)
     page = max(0, min(page, pages - 1))
@@ -861,6 +861,9 @@ async def cb_coins_buy(c: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.regexp(r"^ctag:\d+$"))
 async def cb_coins_tag(c: CallbackQuery, state: FSMContext):
+    tg = db.one("SELECT coin_hidden FROM tags WHERE id=?", (int(c.data.split(":")[1]),))
+    if not tg or tg["coin_hidden"]:  # админ убрал тег из магазина, пока открыт старый список
+        return await c.answer(t("txt_tag_nf"), show_alert=True)
     await render_tag(c, state, int(c.data.split(":")[1]), back_data="coins:buy:0", coins_mode=True)
 
 
