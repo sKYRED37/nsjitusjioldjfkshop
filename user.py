@@ -56,8 +56,43 @@ def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def btn(text, data=None, url=None):
+# Цветные кнопки (Bot API 9.4+, aiogram 3.25+). На старой версии цвет заменяется эмодзи.
+STYLE_OK = "style" in getattr(InlineKeyboardButton, "model_fields", {})
+_FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
+
+
+def btn(text, data=None, url=None, style=None):
+    if style and STYLE_OK:
+        return InlineKeyboardButton(text=text, callback_data=data, url=url, style=style)
+    if style:
+        text = _FALLBACK_EMOJI.get(style, "") + text
     return InlineKeyboardButton(text=text, callback_data=data, url=url)
+
+
+def tag_label(tg):
+    """Подпись тега для покупателя: «🔥 [XT]» у хита, «[XT] - 67%» при скидке."""
+    pct = db.disc_of(tg)
+    name = tg["name"] + (f" - {pct}%" if pct else "")
+    return ("🔥 " if tg["hit"] else "") + name
+
+
+def tag_btn(tg, data):
+    """Кнопка тега для покупателя: скидка — зелёная, хит — с огоньком, закрытый — с замком."""
+    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style="success" if db.disc_of(tg) else None)
+
+
+def left_str(sec):
+    """Сколько осталось: «2 д 3 ч», «5 ч 10 мин»."""
+    if sec is None:
+        return "бессрочно"
+    d, r = divmod(int(sec), 86400)
+    h, r = divmod(r, 3600)
+    m = r // 60
+    if d:
+        return f"{d} д" + (f" {h} ч" if h else "")
+    if h:
+        return f"{h} ч" + (f" {m} мин" if m else "")
+    return f"{max(m, 1)} мин"
 
 
 _banner_ids = {}  # кэш file_id сгенерированных баннеров: ключ → file_id
@@ -253,7 +288,7 @@ async def cb_cat(c: CallbackQuery):
     chunk = tags[page * PAGE:(page + 1) * PAGE]
     rows, line = [], []
     for tg in chunk:
-        line.append(btn(("🔒 " if tg["closed"] else "") + tg["name"], f"tag:{tg['id']}"))
+        line.append(tag_btn(tg, f"tag:{tg['id']}"))
         if len(line) == 2:
             rows.append(line)
             line = []
@@ -334,7 +369,9 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
     tcat = db.one("SELECT banner FROM categories WHERE id=?", (tag["category_id"],))
     prices = db.q("SELECT * FROM prices WHERE tag_id=? ORDER BY price_rub", (tid,))
     pr = db.active_promo(c.from_user.id)
-    pct = db.pct_for(pr, tid)
+    promo_pct = db.pct_for(pr, tid)
+    disc = db.disc_of(tag)
+    pct = db.combine_pct(promo_pct, disc)  # скидка тега + промокод
     rows = []
     sold_out = tag["slots"] is not None and tag["slots"] <= 0
     closed = bool(tag["closed"])
@@ -367,7 +404,7 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
     if manager_url() and not coins_mode:
         rows.append([btn(t("btn_contact"), url=manager_url())])
     rows.append([btn(t("btn_back"), back_data or f"cat:{tag['category_id']}:0")])
-    text = t("txt_tag_head", name=esc(tag["name"]), desc=esc(tag["description"]))
+    text = t("txt_tag_head", name=esc(tag_label(tag)), desc=esc(tag["description"]))
     if tag["slots"] is not None:
         text += "\n" + t("txt_slots", n=max(tag["slots"], 0))
     if closed:
@@ -378,8 +415,10 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
         text += "\n\n" + t("txt_site_pay")
     else:
         text += "\n\n" + t("txt_choose_term")
-    if pct and not site:
-        text += "\n\n" + t("txt_promo_active", code=esc(pr[0]), pct=pct)
+    if disc and not site:
+        text += "\n\n" + t("txt_tag_discount", pct=disc, left=left_str(db.disc_left(tag)))
+    if promo_pct and not site:
+        text += "\n\n" + t("txt_promo_active", code=esc(pr[0]), pct=promo_pct)
     if coins_mode:
         text += "\n\n" + t("txt_coins_tag_balance", balance=fmt(db.coin_balance(c.from_user.id)))
     gen = None
@@ -455,9 +494,10 @@ def calc(data, user_id):
     if not p or is_closed(p["id"]):  # цену/тег удалили или закрыли, пока покупатель оформлял заказ
         return None, None, None, None
     pr = db.active_promo(user_id)
-    pct = db.pct_for(pr, p["tag_id"])
-    if not pct:  # промокод на другой тег — к этому заказу не применяется
+    promo_pct = db.pct_for(pr, p["tag_id"])
+    if not promo_pct:  # промокод на другой тег — к этому заказу не применяется
         pr = None
+    pct = db.combine_pct(promo_pct, db.tag_pct(p["tag_id"]))  # + скидка на тег
     return p, pr, db.apply_discount(p["price_rub"], pct), db.apply_discount(p["price_gold"], pct)
 
 
@@ -468,7 +508,7 @@ def stars_word(n):
 def extra_prices(p, pr):
     """Цены в звёздах и бустах для срока (или None). Скидка промокода действует только на звёзды;
     бусты — штучный товар, скидка к ним не применяется."""
-    pct = pr[1] if pr else 0
+    pct = db.total_pct(pr, p["tag_id"])
     stars = db.apply_discount(p["price_stars"], pct) if p["price_stars"] else None
     boosts = p["price_boosts"] or None
     return stars, boosts
@@ -541,6 +581,7 @@ async def summary(target, state: FSMContext):
         return await summary_coins(target, state, data, p, pr, rub, user_id, lines)
     if pr:
         lines.append(t("txt_order_promo", code=esc(pr[0]), pct=pr[1]))
+    if rub != p["price_rub"]:  # промокод и/или скидка на тег
         lines.append(t("txt_order_card", price=f"<s>{fmt(p['price_rub'])}</s> <b>{fmt(rub)} ₽</b>"))
     else:
         lines.append(t("txt_order_card", price=f"{fmt(rub)} ₽"))
@@ -593,7 +634,7 @@ async def cb_tag_keep(c: CallbackQuery, state: FSMContext):
     tag = db.one("SELECT * FROM tags WHERE id=?", (tid,))
     prices = db.q("SELECT * FROM prices WHERE tag_id=? ORDER BY price_rub", (tid,))
     pr = db.active_promo(c.from_user.id)
-    pct = db.pct_for(pr, tid)
+    pct = db.total_pct(pr, tid)
     rows = []
     for p in prices:
         if tag["closed"]:
@@ -833,7 +874,7 @@ async def cb_coins_buy(c: CallbackQuery, state: FSMContext):
     chunk = tags[page * PAGE:(page + 1) * PAGE]
     rows, line = [], []
     for tg in chunk:
-        line.append(btn(("🔒 " if tg["closed"] else "") + tg["name"], f"ctag:{tg['id']}"))
+        line.append(tag_btn(tg, f"ctag:{tg['id']}"))
         if len(line) == 2:
             rows.append(line)
             line = []

@@ -11,7 +11,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, FSInputFile
 
 import db
-from user import esc, fmt, kb, btn, show, send_review_prompt
+from user import esc, fmt, kb, btn, show, send_review_prompt, left_str
 import links
 import texts
 from texts import t
@@ -48,6 +48,10 @@ class A(StatesGroup):
     order_search = State()
     user_search = State()
     text_edit = State()
+    disc_pct = State()
+    disc_dur = State()
+    gdisc_pct = State()
+    gdisc_dur = State()
 
 
 LINK_SETTINGS = {
@@ -80,6 +84,7 @@ def panel_kb():
         [btn("✏️ Тексты бота", "adm:tx"), btn("🖼 Баннеры", "adm:banners")],
         [btn("⚙️ Настройки", "adm:settings"), btn("🔗 Рефералки", "adm:refs")],
         [btn("📢 Рассылка", "adm:bc"), btn("⭐ Отзывы-канал", "adm:rvchan")],
+        [btn("🔥 Хит продаж", "adm:hits:0"), btn("💸 Скидки", "adm:disc:0")],
         [btn("🪙 Монеты", "adm:coins")],
         [btn("🔧 Режим работ: ВКЛ" if maint else "🔧 Режим работ: выкл", "adm:maint"), btn("💾 Бэкап БД", "adm:backup")],
         [btn("✖️ Закрыть", "adm:close")],
@@ -1564,6 +1569,297 @@ async def cb_txrall_ok(c: CallbackQuery, state: FSMContext):
 
 
 # ---------------- запасной обработчик (должен быть последним) ----------------
+# ---------------- хит продаж и скидки ----------------
+HD_PAGE = 30
+
+
+def _all_tags():
+    return db.q("SELECT t.* FROM tags t JOIN categories g ON g.id=t.category_id ORDER BY g.position, g.id, t.id")
+
+
+def _grid(cells):
+    return [cells[i:i + 2] for i in range(0, len(cells), 2)]
+
+
+def _page(tags, page):
+    pages = max(1, (len(tags) + HD_PAGE - 1) // HD_PAGE)
+    page = max(0, min(page, pages - 1))
+    return tags[page * HD_PAGE:(page + 1) * HD_PAGE], page, pages
+
+
+def _nav(prefix, page, pages):
+    if pages <= 1:
+        return []
+    nav = []
+    if page > 0:
+        nav.append(btn("◀️", f"{prefix}:{page - 1}"))
+    nav.append(btn(f"{page + 1}/{pages}", "adm:noop"))
+    if page < pages - 1:
+        nav.append(btn("▶️", f"{prefix}:{page + 1}"))
+    return [nav]
+
+
+def disc_name(tg):
+    """[XT] - 67% (или просто [XT], если скидки нет)."""
+    pct = db.disc_of(tg)
+    return tg["name"] + (f" - {pct}%" if pct else "")
+
+
+def parse_percent(text):
+    m = re.fullmatch(r"\s*(\d{1,2})\s*%?\s*", text or "")
+    if not m or not 1 <= int(m.group(1)) <= 99:
+        return None
+    return int(m.group(1))
+
+
+_UNITS = (("мес", 30 * 86400), ("мин", 60), ("min", 60), ("м", 60), ("m", 60), ("ч", 3600), ("h", 3600),
+          ("д", 86400), ("d", 86400), ("н", 7 * 86400), ("w", 7 * 86400))
+DUR_HELP = ("Пришли, сколько будет действовать скидка. Примеры: <code>3д</code>, <code>12ч</code>, <code>1д 12ч</code>, "
+            "<code>30м</code>, <code>2н</code>, <code>1мес</code>. Просто число — это дни. "
+            "<code>-</code> — без срока (пока не снимешь).")
+
+
+def parse_duration(text):
+    """Секунды (0 — бессрочно) или None, если не разобрать."""
+    s = (text or "").strip().lower()
+    if s in ("-", "0", "навсегда", "бессрочно", "∞"):
+        return 0
+    token = r"(\d+)\s*([a-zа-яё]*)"
+    if not s or re.sub(token + r"|[\s,]", "", s):
+        return None
+    total = 0
+    for num, unit in re.findall(token, s):
+        mult = 86400 if not unit else next((k for pre, k in _UNITS if unit.startswith(pre)), None)
+        if mult is None:
+            return None
+        total += int(num) * mult
+    return total or None
+
+
+# ----- хит продаж -----
+@router.callback_query(F.data.regexp(r"^adm:hits:\d+$"))
+async def cb_hits(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await hits_view(c, int(c.data.split(":")[2]))
+
+
+async def hits_view(c, page):
+    tags = _all_tags()
+    chunk, page, pages = _page(tags, page)
+    cells = [btn(tg["name"], f"adm:hit_t:{tg['id']}:{page}", style="danger" if tg["hit"] else None) for tg in chunk]
+    rows = _grid(cells) + _nav("adm:hits", page, pages) + [back()]
+    n = sum(1 for tg in tags if tg["hit"])
+    text = ("🔥 <b>Хит продаж</b>\n\nНажми на тег — он станет хитом (подсветится красным, у покупателей будет «🔥 [XT]»). "
+            f"Нажми ещё раз — хит снимется.\nСейчас хитов: <b>{n}</b>")
+    if not tags:
+        text = "Тегов пока нет."
+    await show(c, text, kb(rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm:hit_t:\d+:\d+$"))
+async def cb_hit_t(c: CallbackQuery):
+    _, _, _, tid, page = c.data.split(":")
+    db.toggle_hit(int(tid))
+    await hits_view(c, int(page))
+
+
+# ----- скидки: список и карточка тега -----
+@router.callback_query(F.data.regexp(r"^adm:disc:\d+$"))
+async def cb_disc(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await disc_view(c, int(c.data.split(":")[2]))
+
+
+async def disc_view(c, page):
+    tags = _all_tags()
+    chunk, page, pages = _page(tags, page)
+    cells = [btn(disc_name(tg), f"adm:disc_t:{tg['id']}:{page}", style="success" if db.disc_of(tg) else None) for tg in chunk]
+    rows = [[btn("👥 Скидка на несколько тегов", "adm:dgrp")]] + _grid(cells) + _nav("adm:disc", page, pages) + [back()]
+    n = sum(1 for tg in tags if db.disc_of(tg))
+    text = ("💸 <b>Скидки</b>\n\nНажми на тег, чтобы задать ему скидку. Зелёные — со скидкой "
+            f"(у покупателей «[XT] - 67%»). Сейчас со скидкой: <b>{n}</b>")
+    if not tags:
+        text = "Тегов пока нет."
+    await show(c, text, kb(rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm:disc_t:\d+:\d+$"))
+async def cb_disc_t(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    _, _, _, tid, page = c.data.split(":")
+    await disc_card(c, int(tid), int(page))
+
+
+async def disc_card(c, tid, page):
+    tg = db.one("SELECT * FROM tags WHERE id=?", (tid,))
+    if not tg:
+        return await c.answer("Нет такого тега", show_alert=True)
+    pct = db.disc_of(tg)
+    if pct:
+        cur = f"🟢 Сейчас: <b>{pct}%</b> — {left_str(db.disc_left(tg))}"
+    else:
+        cur = "Скидки сейчас нет."
+    rows = [[btn("✏️ Ввести скидку", f"adm:disc_set:{tid}:{page}")]]
+    if pct:
+        rows.append([btn("🗑 Снять скидку", f"adm:disc_off:{tid}:{page}")])
+    rows.append(back(f"adm:disc:{page}"))
+    await show(c, f"💸 <b>{esc(tg['name'])}</b> {esc(tg['description'])}\n{cur}", kb(rows))
+
+
+@router.callback_query(F.data.regexp(r"^adm:disc_off:\d+:\d+$"))
+async def cb_disc_off(c: CallbackQuery):
+    _, _, _, tid, page = c.data.split(":")
+    db.clear_discount([int(tid)])
+    await c.answer("Скидка снята")
+    await disc_card(c, int(tid), int(page))
+
+
+@router.callback_query(F.data.regexp(r"^adm:disc_set:\d+:\d+$"))
+async def cb_disc_set(c: CallbackQuery, state: FSMContext):
+    _, _, _, tid, page = c.data.split(":")
+    tg = db.one("SELECT name FROM tags WHERE id=?", (int(tid),))
+    if not tg:
+        return await c.answer("Нет такого тега", show_alert=True)
+    await state.set_state(A.disc_pct)
+    await state.update_data(tid=int(tid), page=int(page))
+    await show(c, f"💸 Скидка на <b>{esc(tg['name'])}</b>\n\nПришли процент скидки числом от 1 до 99, например <code>67</code>:",
+               kb([back(f"adm:disc_t:{tid}:{page}")]))
+
+
+@router.message(A.disc_pct, F.text, ~F.text.startswith("/"))
+async def got_disc_pct(m: Message, state: FSMContext):
+    pct = parse_percent(m.text)
+    if pct is None:
+        return await m.answer("❗ Нужно число от 1 до 99. Попробуй ещё раз:")
+    await state.update_data(pct=pct)
+    await state.set_state(A.disc_dur)
+    await m.answer(f"Скидка <b>{pct}%</b>. " + DUR_HELP)
+
+
+@router.message(A.disc_dur, F.text, ~F.text.startswith("/"))
+async def got_disc_dur(m: Message, state: FSMContext):
+    sec = parse_duration(m.text)
+    if sec is None:
+        return await m.answer("❗ Не понял срок.\n" + DUR_HELP)
+    data = await state.get_data()
+    tid, page, pct = data["tid"], data.get("page", 0), data["pct"]
+    tg = db.one("SELECT name FROM tags WHERE id=?", (tid,))
+    await state.clear()
+    if not tg:
+        return await m.answer("Тег уже удалён.", reply_markup=kb([[btn("💸 К скидкам", "adm:disc:0")]]))
+    db.set_discount([tid], pct, sec)
+    await m.answer(f"✅ <b>{esc(tg['name'])} - {pct}%</b> — {left_str(sec or None)}",
+                   reply_markup=kb([[btn("💸 К скидкам", f"adm:disc:{page}")]]))
+
+
+# ----- скидки: несколько тегов сразу -----
+async def dgrp_view(c, state, page):
+    await state.set_state(None)  # выходим из ввода процента/срока, если вернулись назад; выбор тегов сохраняется
+    data = await state.get_data()
+    sel = set(data.get("sel", []))
+    tags = _all_tags()
+    chunk, page, pages = _page(tags, page)
+    cells = [btn(("✅ " if tg["id"] in sel else "") + disc_name(tg), f"adm:dgs:{tg['id']}:{page}",
+                 style="success" if tg["id"] in sel else None) for tg in chunk]
+    rows = _grid(cells) + _nav("adm:dgp", page, pages)
+    rows.append([btn("☑️ Все на странице", f"adm:dga:{page}"), btn("♻️ Сбросить выбор", f"adm:dgc:{page}")])
+    if sel:
+        rows.append([btn(f"✏️ Ввести скидку ({len(sel)})", "adm:dgo")])
+        rows.append([btn(f"🗑 Снять скидку у выбранных ({len(sel)})", "adm:dgx")])
+    rows.append(back("adm:disc:0"))
+    text = ("👥 <b>Скидка на несколько тегов</b>\n\nОтметь теги (✅), затем «Ввести скидку» — процент и срок "
+            f"применятся ко всем отмеченным. Потом можно отметить другие теги и поставить им другую скидку.\nВыбрано: <b>{len(sel)}</b>")
+    await show(c, text, kb(rows))
+
+
+@router.callback_query(F.data == "adm:dgrp")
+async def cb_dgrp(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.update_data(sel=[])
+    await dgrp_view(c, state, 0)
+
+
+@router.callback_query(F.data.regexp(r"^adm:dgp:\d+$"))
+async def cb_dgp(c: CallbackQuery, state: FSMContext):
+    await dgrp_view(c, state, int(c.data.split(":")[2]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:dgs:\d+:\d+$"))
+async def cb_dgs(c: CallbackQuery, state: FSMContext):
+    _, _, tid, page = c.data.split(":")
+    sel = set((await state.get_data()).get("sel", []))
+    sel ^= {int(tid)}
+    await state.update_data(sel=sorted(sel))
+    await dgrp_view(c, state, int(page))
+
+
+@router.callback_query(F.data.regexp(r"^adm:dga:\d+$"))
+async def cb_dga(c: CallbackQuery, state: FSMContext):
+    page = int(c.data.split(":")[2])
+    chunk, page, _ = _page(_all_tags(), page)
+    sel = set((await state.get_data()).get("sel", [])) | {tg["id"] for tg in chunk}
+    await state.update_data(sel=sorted(sel))
+    await dgrp_view(c, state, page)
+
+
+@router.callback_query(F.data.regexp(r"^adm:dgc:\d+$"))
+async def cb_dgc(c: CallbackQuery, state: FSMContext):
+    await state.update_data(sel=[])
+    await dgrp_view(c, state, int(c.data.split(":")[2]))
+
+
+def _sel_names(sel):
+    names = [r["name"] for r in db.q(f"SELECT name FROM tags WHERE id IN ({','.join('?' * len(sel))})", tuple(sel))] if sel else []
+    return ", ".join(esc(n) for n in names[:15]) + (f" и ещё {len(names) - 15}" if len(names) > 15 else "")
+
+
+@router.callback_query(F.data == "adm:dgx")
+async def cb_dgx(c: CallbackQuery, state: FSMContext):
+    sel = (await state.get_data()).get("sel", [])
+    if not sel:
+        return await c.answer("Ничего не выбрано", show_alert=True)
+    db.clear_discount(sel)
+    await state.update_data(sel=[])
+    await c.answer(f"Скидка снята у {len(sel)} тег.")
+    await dgrp_view(c, state, 0)
+
+
+@router.callback_query(F.data == "adm:dgo")
+async def cb_dgo(c: CallbackQuery, state: FSMContext):
+    sel = (await state.get_data()).get("sel", [])
+    if not sel:
+        return await c.answer("Сначала отметь теги", show_alert=True)
+    await state.set_state(A.gdisc_pct)
+    await show(c, f"👥 Скидка на {len(sel)} тег.: {_sel_names(sel)}\n\nПришли процент скидки числом от 1 до 99, например <code>67</code>:",
+               kb([back("adm:dgp:0")]))
+
+
+@router.message(A.gdisc_pct, F.text, ~F.text.startswith("/"))
+async def got_gdisc_pct(m: Message, state: FSMContext):
+    pct = parse_percent(m.text)
+    if pct is None:
+        return await m.answer("❗ Нужно число от 1 до 99. Попробуй ещё раз:")
+    await state.update_data(pct=pct)
+    await state.set_state(A.gdisc_dur)
+    await m.answer(f"Скидка <b>{pct}%</b>. " + DUR_HELP)
+
+
+@router.message(A.gdisc_dur, F.text, ~F.text.startswith("/"))
+async def got_gdisc_dur(m: Message, state: FSMContext):
+    sec = parse_duration(m.text)
+    if sec is None:
+        return await m.answer("❗ Не понял срок.\n" + DUR_HELP)
+    data = await state.get_data()
+    sel, pct = data.get("sel", []), data["pct"]
+    names = _sel_names(sel)
+    db.set_discount(sel, pct, sec)
+    await state.clear()
+    await state.update_data(sel=[])
+    await m.answer(f"✅ Скидка <b>{pct}%</b> — {left_str(sec or None)}\nТеги ({len(sel)}): {names}",
+                   reply_markup=kb([[btn("👥 Ещё одна скидка", "adm:dgrp")], [btn("💸 К скидкам", "adm:disc:0")]]))
+
+
+
 @router.message(StateFilter(A), ~F.text)
 async def not_text(m: Message):
     await m.answer("Нужно отправить обычное текстовое сообщение (или картинку, если бот просит картинку). Выйти — /admin.")

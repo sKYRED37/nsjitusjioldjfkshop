@@ -90,7 +90,10 @@ def init(owner_id: int):
                      ("prices", "price_stars INTEGER"), ("prices", "price_boosts INTEGER"),
                      ("promocodes", "tag_id INTEGER"),
                      ("prices", "coins INTEGER"), ("orders", "price_id INTEGER"),
-                     ("tags", "coin_hidden INTEGER DEFAULT 0")]:  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
+                     ("tags", "coin_hidden INTEGER DEFAULT 0"),
+                     ("tags", "hit INTEGER DEFAULT 0"),        # хит продаж
+                     ("tags", "disc_pct INTEGER"),             # скидка на тег, %
+                     ("tags", "disc_until INTEGER")]:          # до какого времени (unix), NULL = бессрочно  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -198,6 +201,60 @@ def consume_promo(user_id: int, code: str):
     ex("UPDATE promocodes SET used_count=used_count+1 WHERE code=?", (code,))
     ex("INSERT INTO promo_uses VALUES(?,?)", (code, user_id))
     ex("DELETE FROM user_promo WHERE user_id=?", (user_id,))
+
+
+# ---------- хит продаж и скидки на теги ----------
+def disc_of(tg):
+    """Действующая скидка тега в % (0 — нет или уже истекла). tg — строка из таблицы tags."""
+    pct = tg["disc_pct"] if tg is not None else 0
+    if not pct:
+        return 0
+    until = tg["disc_until"]
+    if until is not None and until <= int(time.time()):
+        return 0
+    return int(pct)
+
+
+def disc_left(tg):
+    """Секунд до конца скидки; None — скидка бессрочная (или её нет)."""
+    if not disc_of(tg) or tg["disc_until"] is None:
+        return None
+    return max(0, int(tg["disc_until"]) - int(time.time()))
+
+
+def tag_pct(tag_id):
+    return disc_of(one("SELECT disc_pct, disc_until FROM tags WHERE id=?", (tag_id,)))
+
+
+def combine_pct(promo_pct, tag_disc):
+    """Скидка тега и промокод складываются последовательно: (1-a)*(1-b)."""
+    a, b = int(promo_pct or 0), int(tag_disc or 0)
+    if not a or not b:
+        return a or b
+    return min(99, round(100 - (100 - a) * (100 - b) / 100))
+
+
+def total_pct(pr, tag_id):
+    """Итоговый процент для тега: скидка тега + промокод (pr — из active_promo)."""
+    return combine_pct(pct_for(pr, tag_id), tag_pct(tag_id))
+
+
+def set_discount(tag_ids, pct, seconds):
+    """Ставит скидку pct% на теги. seconds=0 — бессрочно."""
+    until = int(time.time()) + int(seconds) if seconds else None
+    for tid in tag_ids:
+        _conn.execute("UPDATE tags SET disc_pct=?, disc_until=? WHERE id=?", (int(pct), until, int(tid)))
+    _conn.commit()
+
+
+def clear_discount(tag_ids):
+    for tid in tag_ids:
+        _conn.execute("UPDATE tags SET disc_pct=NULL, disc_until=NULL WHERE id=?", (int(tid),))
+    _conn.commit()
+
+
+def toggle_hit(tag_id):
+    ex("UPDATE tags SET hit=1-COALESCE(hit,0) WHERE id=?", (int(tag_id),))
 
 
 def apply_discount(price, percent):
