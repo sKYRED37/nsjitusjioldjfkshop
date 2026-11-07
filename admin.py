@@ -1102,7 +1102,7 @@ async def cshop_view(c, page):
 
 @router.callback_query(F.data.regexp(r"^adm:cshop_t:\d+:\d+$"))
 async def cb_cshop_t(c: CallbackQuery):
-    _, _, _, tid, page = c.data.split(":")
+    _, _, tid, page = c.data.split(":")
     db.ex("UPDATE tags SET coin_hidden=1-COALESCE(coin_hidden,0) WHERE id=?", (int(tid),))
     await cshop_view(c, int(page))
 
@@ -1633,7 +1633,7 @@ def parse_duration(text):
         if mult is None:
             return None
         total += int(num) * mult
-    return total or None
+    return min(total, 3650 * 86400) if total else None
 
 
 # ----- хит продаж -----
@@ -1658,7 +1658,7 @@ async def hits_view(c, page):
 
 @router.callback_query(F.data.regexp(r"^adm:hit_t:\d+:\d+$"))
 async def cb_hit_t(c: CallbackQuery):
-    _, _, _, tid, page = c.data.split(":")
+    _, _, tid, page = c.data.split(":")
     db.toggle_hit(int(tid))
     await hits_view(c, int(page))
 
@@ -1686,7 +1686,7 @@ async def disc_view(c, page):
 @router.callback_query(F.data.regexp(r"^adm:disc_t:\d+:\d+$"))
 async def cb_disc_t(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    _, _, _, tid, page = c.data.split(":")
+    _, _, tid, page = c.data.split(":")
     await disc_card(c, int(tid), int(page))
 
 
@@ -1708,7 +1708,7 @@ async def disc_card(c, tid, page):
 
 @router.callback_query(F.data.regexp(r"^adm:disc_off:\d+:\d+$"))
 async def cb_disc_off(c: CallbackQuery):
-    _, _, _, tid, page = c.data.split(":")
+    _, _, tid, page = c.data.split(":")
     db.clear_discount([int(tid)])
     await c.answer("Скидка снята")
     await disc_card(c, int(tid), int(page))
@@ -1716,7 +1716,7 @@ async def cb_disc_off(c: CallbackQuery):
 
 @router.callback_query(F.data.regexp(r"^adm:disc_set:\d+:\d+$"))
 async def cb_disc_set(c: CallbackQuery, state: FSMContext):
-    _, _, _, tid, page = c.data.split(":")
+    _, _, tid, page = c.data.split(":")
     tg = db.one("SELECT name FROM tags WHERE id=?", (int(tid),))
     if not tg:
         return await c.answer("Нет такого тега", show_alert=True)
@@ -1760,7 +1760,7 @@ async def dgrp_view(c, state, page):
     tags = _all_tags()
     chunk, page, pages = _page(tags, page)
     cells = [btn(("✅ " if tg["id"] in sel else "") + disc_name(tg), f"adm:dgs:{tg['id']}:{page}",
-                 style="success" if tg["id"] in sel else None) for tg in chunk]
+                 style="success" if db.disc_of(tg) else None) for tg in chunk]
     rows = _grid(cells) + _nav("adm:dgp", page, pages)
     rows.append([btn("☑️ Все на странице", f"adm:dga:{page}"), btn("♻️ Сбросить выбор", f"adm:dgc:{page}")])
     if sel:

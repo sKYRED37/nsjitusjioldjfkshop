@@ -56,8 +56,9 @@ def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# Цветные кнопки (Bot API 9.4+, aiogram 3.25+). На старой версии цвет заменяется эмодзи.
-STYLE_OK = "style" in getattr(InlineKeyboardButton, "model_fields", {})
+# Цвет кнопок: по умолчанию эмодзи 🟢 (скидка) и 🔴 (хит в админке) — работает везде.
+USE_NATIVE_STYLE = False  # True — красить кнопки средствами Telegram (если у тебя новый aiogram и Telegram их принимает)
+STYLE_OK = USE_NATIVE_STYLE and "style" in getattr(InlineKeyboardButton, "model_fields", {})
 _FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
 
 
