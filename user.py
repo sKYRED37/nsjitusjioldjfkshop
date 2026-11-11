@@ -84,15 +84,18 @@ def btn(text, data=None, url=None, style=None):
 
 
 def tag_label(tg):
-    """Подпись тега для покупателя: «🔥 [XT]» у хита, «[XT] - 67%» при скидке."""
+    """Подпись тега: хит отмечается огоньком, скидка — зелёным маркером и полным текстом."""
     pct = db.disc_of(tg)
-    name = tg["name"] + (f" - {pct}%" if pct else "")
-    return ("🔴 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
+    name = tg["name"] + (f" - Скидка {pct}%" if pct else "")
+    return ("🔥 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
 
 
 def tag_btn(tg, data):
-    """Кнопка тега для покупателя: скидка — зелёная, хит — с огоньком, закрытый — с замком."""
-    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style="success" if db.disc_of(tg) else ("danger" if tg["hit"] else None))
+    """Кнопка тега: хит — красный стиль, скидка — зелёный стиль; закрытый — с замком."""
+    # Если одновременно хит и скидка, приоритет красного стиля у хита,
+    # а скидка дополнительно отмечается зелёным маркером в подписи.
+    style = "danger" if tg["hit"] else ("success" if db.disc_of(tg) else None)
+    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style=style)
 
 
 def left_str(sec):
