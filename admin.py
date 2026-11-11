@@ -52,6 +52,7 @@ class A(StatesGroup):
     disc_dur = State()
     gdisc_pct = State()
     gdisc_dur = State()
+    case_create = State()
 
 
 LINK_SETTINGS = {
@@ -85,7 +86,7 @@ def panel_kb():
         [btn("⚙️ Настройки", "adm:settings"), btn("🔗 Рефералки", "adm:refs")],
         [btn("📢 Рассылка", "adm:bc"), btn("⭐ Отзывы-канал", "adm:rvchan")],
         [btn("🔥 Хит продаж", "adm:hits:0"), btn("💸 Скидки", "adm:disc:0")],
-        [btn("🪙 Монеты", "adm:coins")],
+        [btn("🎁 Кейсы", "adm:cases"), btn("💎 RECOINS", "adm:coins")],
         [btn("🔧 Режим работ: ВКЛ" if maint else "🔧 Режим работ: выкл", "adm:maint"), btn("💾 Бэкап БД", "adm:backup")],
         [btn("✖️ Закрыть", "adm:close")],
     ])
@@ -111,6 +112,122 @@ async def cb_close(c: CallbackQuery):
 
 def back(to="adm:panel"):
     return [btn("↩️ Назад", to)]
+
+
+
+# ---------------- управление кейсами ----------------
+@router.callback_query(F.data == "adm:cases")
+async def admin_cases(c: CallbackQuery, state: FSMContext = None):
+    if state:
+        await state.clear()
+    cases = db.q("SELECT * FROM cases ORDER BY id DESC")
+    rows = [[btn(f"{x['name']} · {x['price_rub']} ₽ / {x['price_gold']} голды", f"adm:caseview:{x['id']}")] for x in cases]
+    rows += [[btn("➕ Создать кейс", "adm:caseadd")], back()]
+    await show(c, "🎁 <b>Кейсы</b>\nСоздание: название | редкость | цена ₽ | цена голды | ID тегов", kb(rows))
+
+
+@router.callback_query(F.data == "adm:caseadd")
+async def admin_case_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(A.case_create)
+    await show(c, "Пришли одной строкой:\n<code>Название | Обычный/Редкий/Легендарный | цена ₽ | цена голды | id_тегов</code>\n\nПример: <code>Золотой | Редкий | 199 | 50 | 1,2,5</code>", kb([back("adm:cases")]))
+
+
+@router.message(A.case_create)
+async def admin_case_save(m: Message, state: FSMContext):
+    try:
+        name, rarity, rub, gold, ids = [x.strip() for x in (m.text or "").split("|", 4)]
+        if rarity not in ("Обычный", "Редкий", "Легендарный") or int(rub) < 0 or int(gold) < 0 or (int(rub) == 0 and int(gold) == 0):
+            raise ValueError()
+        tag_ids = list(dict.fromkeys(int(x.strip()) for x in ids.split(",") if x.strip()))
+        if not name or not tag_ids or any(not db.one("SELECT id FROM tags WHERE id=?", (tid,)) for tid in tag_ids):
+            raise ValueError()
+        cid = db.ex("INSERT INTO cases(name,rarity,price,active,price_rub,price_gold) VALUES(?,?,0,1,?,?)", (name, rarity, int(rub), int(gold)))
+        for tid in tag_ids:
+            db.ex("INSERT INTO case_tags(case_id,tag_id) VALUES(?,?)", (cid, tid))
+    except Exception:
+        return await m.answer("Формат неверный. Пример: Название | Редкий | 199 | 50 | 1,2,5")
+    await state.clear()
+    await m.answer(f"✅ Кейс «{esc(name)}» создан. ID: {cid}", reply_markup=kb([[btn("🎁 К кейсам", "adm:cases")], back()]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:caseview:\d+$"))
+async def admin_case_view(c: CallbackQuery):
+    cid = int(c.data.split(":")[2])
+    x = db.one("SELECT * FROM cases WHERE id=?", (cid,))
+    if not x:
+        return await c.answer("Кейс не найден", show_alert=True)
+    tags = db.q("SELECT t.name FROM case_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.case_id=?", (cid,))
+    await show(c, f"<b>{esc(x['name'])}</b> · {esc(x['rarity'])}\nЦена: {x['price_rub']} ₽ / {x['price_gold']} голды\nПул: {', '.join(esc(tg['name']) for tg in tags)}",
+               kb([[btn("🗑 Удалить кейс", f"adm:casedel:{cid}")], [btn("↩️ Назад", "adm:cases")]]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:casedel:\d+$"))
+async def admin_case_delete(c: CallbackQuery):
+    cid = int(c.data.split(":")[2])
+    db.ex("DELETE FROM case_tags WHERE case_id=?", (cid,))
+    db.ex("DELETE FROM cases WHERE id=?", (cid,))
+    await admin_cases(c, None)
+
+
+# ---------------- решение по заявке на выдачу тега из кейса ----------------
+@router.callback_query(F.data.regexp(r"^adm:caseissue:(issued|refused):\d+$"))
+async def admin_case_issue_decide(c: CallbackQuery, bot: Bot):
+    _, _, status, draw_id = c.data.split(":")
+    draw = db.one("SELECT d.*, t.name tag_name, cs.name case_name FROM case_draws d "
+                  "JOIN tags t ON t.id=d.tag_id JOIN cases cs ON cs.id=d.case_id WHERE d.id=?",
+                  (int(draw_id),))
+    if not draw or draw["issue_status"] != "pending":
+        return await c.answer("Заявка уже обработана или не найдена", show_alert=True)
+    db.ex("UPDATE case_draws SET issue_status=?, decided_at=? WHERE id=? AND issue_status='pending'",
+          (status, int(time.time()), int(draw_id)))
+    if status == "issued":
+        user_text = (f"✅ <b>Тег выдан!</b>\nКейс: {esc(draw['case_name'])}\n"
+                     f"Тег: <b>{esc(draw['tag_name'])}</b>\nИгровой ID: <code>{esc(draw['game_id'] or '')}</code>")
+        admin_text = "\n\n✅ Статус заявки изменён: тег выдан."
+    else:
+        user_text = (f"❌ <b>В выдаче тега отказано.</b>\nКейс: {esc(draw['case_name'])}\n"
+                     f"Тег: <b>{esc(draw['tag_name'])}</b>\nЕсли считаешь, что это ошибка, свяжись с поддержкой.")
+        admin_text = "\n\n❌ Статус заявки изменён: отказано."
+    try:
+        await bot.send_message(draw["user_id"], user_text)
+    except Exception:
+        pass
+    try:
+        await c.message.edit_reply_markup(reply_markup=None)
+        await c.message.edit_text((c.message.text or "") + admin_text)
+    except Exception:
+        pass
+    await c.answer("Решение сохранено")
+
+
+# ---------------- проверка оплаты кейсов ----------------
+@router.callback_query(F.data.regexp(r"^adm:case(ok|no):\d+$"))
+async def admin_case_order_decide(c: CallbackQuery, bot: Bot):
+    _, action, oid = c.data.split(":")
+    order = db.one("SELECT * FROM case_orders WHERE id=?", (int(oid),))
+    if not order or order["status"] != "pending":
+        return await c.answer("Заказ уже обработан или не найден", show_alert=True)
+    if action == "caseok":
+        pool = db.q("SELECT t.id FROM case_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.case_id=? AND t.hidden=0 AND t.closed=0", (order["case_id"],))
+        if not pool:
+            return await c.answer("В пуле кейса нет доступных тегов", show_alert=True)
+        import random
+        chosen = random.choice(pool)
+        db.ex("UPDATE case_orders SET status='paid',tag_id=? WHERE id=? AND status='pending'", (chosen["id"], order["id"]))
+        case = db.one("SELECT name FROM cases WHERE id=?", (order["case_id"],))
+        tag = db.one("SELECT name FROM tags WHERE id=?", (chosen["id"],))
+        db.ex("INSERT INTO case_draws(user_id,case_id,tag_id,price,created_at) VALUES(?,?,?,?,?)", (order["user_id"], order["case_id"], chosen["id"], order["amount"], int(time.time())))
+        try: await bot.send_message(order["user_id"], f"🎉 Оплата кейса «{esc(case['name'])}» подтверждена!\nТебе выпал тег: <b>{esc(tag['name'])}</b>.\nОн сохранён в разделе «🎒 Мои кейсы».")
+        except Exception: pass
+        result = f"\n\n✅ Подтверждено. Выдан тег: {esc(tag['name'])}"
+    else:
+        db.ex("UPDATE case_orders SET status='rejected' WHERE id=? AND status='pending'", (order["id"],))
+        try: await bot.send_message(order["user_id"], f"❌ Оплата кейса #{order['id']} отклонена владельцем. Если это ошибка, свяжись с поддержкой.")
+        except Exception: pass
+        result = "\n\n❌ Оплата отклонена"
+    try: await c.message.edit_caption((c.message.caption or "") + result, reply_markup=None)
+    except Exception: pass
+    await c.answer("Решение сохранено")
 
 
 # ---------------- заказы ----------------
@@ -351,7 +468,7 @@ PRICE_HELP = ("<code>Срок | цена ₽ | цена голдой | ссыл�
               "<code>Неделя | 200 | 400 | - | зв=150 | буст=3 | мон=25</code>")
 _STARS = re.compile(r"(?i)^(?:зв\w*|stars?|⭐)\s*[=:]?\s*(\d+)$")
 _BOOST = re.compile(r"(?i)^(?:буст\w*|boosts?|🚀)\s*[=:]?\s*(\d+)$")
-_COINS = re.compile(r"(?i)^(?:мон\w*|coins?|🪙)\s*[=:]?\s*(\d+)$")
+_RECOINS = re.compile(r"(?i)^(?:мон\w*|coins?|🪙)\s*[=:]?\s*(\d+)$")
 
 
 def parse_price(line):
@@ -368,7 +485,7 @@ def parse_price(line):
             r["stars"] = int(m.group(1)) or None
         elif m := _BOOST.match(x):
             r["boosts"] = int(m.group(1)) or None
-        elif m := _COINS.match(x):
+        elif m := _RECOINS.match(x):
             r["coins"] = int(m.group(1))
         elif u := links.norm_url(x):
             r["url"] = u
@@ -384,14 +501,14 @@ async def cb_adm_coins(c: CallbackQuery, state: FSMContext):
     total = db.one("SELECT COALESCE(SUM(delta),0) s FROM coin_log")["s"]
     holders = db.one("SELECT COUNT(*) n FROM (SELECT user_id FROM coin_log GROUP BY user_id HAVING SUM(delta)>0)")["n"]
     text = (f"🪙 <b>Монеты</b>\n\nНачисление за покупку: <b>{db.coin_percent()}%</b> от цены (после подтверждения заказа, любой способ оплаты, кроме монет). "
-            f"Своё число монет на цену: тег → цена → «🪙 Монеты за покупку».\nЦена тега в койнах: цена в ₽ × <b>{db.coin_mult()}</b>\n\n"
+            f"Своё число монет на цену: тег → цена → «💎 RECOINS за покупку».\nЦена тега в койнах: цена в ₽ × <b>{db.coin_mult()}</b>\n\n"
             f"🎁 Ежедневный бонус: от <b>{db.bonus_range()[0]}</b> до <b>{db.bonus_range()[1]}</b> монет раз в 24 ч, редкость крупных: <b>{db.bonus_curve()}</b>/10\n\n"
             f"В обороте: <b>{fmt(total)}</b> 🪙 у {holders} чел.")
     await show(c, text, kb([
         [btn("✏️ % начисления", "adm:coins_set:pct"), btn("✏️ Цена в койнах (×)", "adm:coins_set:mult")],
         [btn("🎁 Бонус: мин", "adm:coins_set:bmin"), btn("🎁 Бонус: макс", "adm:coins_set:bmax")],
         [btn("🎲 Бонус: редкость крупных", "adm:coins_set:bcurve")],
-        [btn("🏷 Теги в магазине COINS", "adm:cshop:0")],
+        [btn("🏷 Теги в магазине RECOINS", "adm:cshop:0")],
         [btn("🎁 Выдать / списать монеты", "adm:coins_grant")],
         back(),
     ]))
@@ -616,10 +733,10 @@ async def tag_view(c, tid):
     rows.append([btn("✏️ Название/описание", f"adm:tag_ed:{tid}"), btn("🖼 Баннер" + (" ✓" if t["banner"] else ""), f"adm:eb:tag:{tid}")])
     rows.append([btn("🔓 Открыть покупку" if t["closed"] else "🔒 Закрыть покупку", f"adm:tag_c:{tid}")])
     rows.append([btn("👁 Показать пользователям" if t["hidden"] else "🙈 Скрыть от пользователей", f"adm:tag_h:{tid}")])
-    rows.append([btn("🪙 Вернуть в магазин COINS" if t["coin_hidden"] else "🪙 Убрать из магазина COINS", f"adm:tag_ch:{tid}")])
+    rows.append([btn("🪙 Вернуть в магазин RECOINS" if t["coin_hidden"] else "🪙 Убрать из магазина RECOINS", f"adm:tag_ch:{tid}")])
     rows.append([btn("🗑 Удалить тег", f"adm:tag_del:{tid}")])
     rows.append(back(f"adm:cat:{t['category_id']}"))
-    await show(c, f"🏷 <b>{esc(t['name'])}</b> {esc(t['description'])}\nСвободных мест: {t['slots'] if t['slots'] is not None else '∞'}\n{'🔒 Покупка закрыта (тег виден, купить нельзя)' + chr(10) if t['closed'] else ''}{'🙈 Скрыт от пользователей' + chr(10) if t['hidden'] else ''}{'🪙 Убран из магазина COINS (в каталоге виден)' + chr(10) if t['coin_hidden'] else ''}Нажми на цену, чтобы изменить или удалить её.", kb(rows))
+    await show(c, f"🏷 <b>{esc(t['name'])}</b> {esc(t['description'])}\nСвободных мест: {t['slots'] if t['slots'] is not None else '∞'}\n{'🔒 Покупка закрыта (тег виден, купить нельзя)' + chr(10) if t['closed'] else ''}{'🙈 Скрыт от пользователей' + chr(10) if t['hidden'] else ''}{'🪙 Убран из магазина RECOINS (в каталоге виден)' + chr(10) if t['coin_hidden'] else ''}Нажми на цену, чтобы изменить или удалить её.", kb(rows))
 
 
 @router.callback_query(F.data.regexp(r"^adm:pr_add:\d+$"))
@@ -1092,7 +1209,7 @@ async def cshop_view(c, page):
         rows.append(nav)
     rows.append(back("adm:coins"))
     shown = sum(1 for tg in tags if not tg["coin_hidden"] and not tg["hidden"])
-    text = (f"🏷 <b>Теги в магазине COINS</b>\n\n✅ — продаётся за койны, 🚫 — убран из магазина (в обычном каталоге остаётся). "
+    text = (f"🏷 <b>Теги в магазине RECOINS</b>\n\n✅ — продаётся за койны, 🚫 — убран из магазина (в обычном каталоге остаётся). "
             f"Нажми на тег, чтобы переключить.\nВидно покупателям в магазине: <b>{shown}</b> из {len(tags)}"
             + ("\n🙈 — тег целиком скрыт от пользователей." if any(tg["hidden"] for tg in tags) else ""))
     if not tags:
@@ -1132,7 +1249,7 @@ async def show_price(c, pid):
             f"🪙 Монет за покупку: {p['coins'] if p['coins'] is not None else 'авто (' + str(db.coin_percent()) + '% = ' + str(db.coins_reward(p)) + ')'}"
             + ("\n🔒 Этот срок закрыт для покупки" if p["closed"] else ""))
     await show(c, text, kb([[btn("🔓 Открыть срок" if p["closed"] else "🔒 Закрыть срок", f"adm:pr_c:{p['id']}")],
-                            [btn("🪙 Монеты за покупку", f"adm:pr_coins:{p['id']}")],
+                            [btn("💎 RECOINS за покупку", f"adm:pr_coins:{p['id']}")],
                             [btn("✏️ Изменить", f"adm:pr_ed:{p['id']}"), btn("🗑 Удалить", f"adm:pr_del:{p['id']}")],
                             back(f"adm:tag:{p['tag_id']}")]))
 

@@ -78,9 +78,26 @@ def init(owner_id: int):
             tag TEXT, term TEXT, order_id INTEGER, created_at INTEGER);
         CREATE INDEX IF NOT EXISTS idx_coin_log_user ON coin_log(user_id);
         CREATE TABLE IF NOT EXISTS bonus_state(user_id INTEGER PRIMARY KEY, last_at INTEGER);
+        CREATE TABLE IF NOT EXISTS favorites(
+            user_id INTEGER, tag_id INTEGER, added_at INTEGER,
+            last_disc INTEGER DEFAULT 0, last_price INTEGER, end_warned INTEGER DEFAULT 0,
+            PRIMARY KEY(user_id, tag_id));
+        CREATE INDEX IF NOT EXISTS idx_fav_tag ON favorites(tag_id);
         CREATE TABLE IF NOT EXISTS ref_visits(
             code TEXT, user_id INTEGER, is_new INTEGER DEFAULT 0, at INTEGER,
             PRIMARY KEY(code, user_id));
+        CREATE TABLE IF NOT EXISTS cases(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, rarity TEXT NOT NULL,
+            price INTEGER NOT NULL DEFAULT 0, active INTEGER DEFAULT 1, price_rub INTEGER DEFAULT 0, price_gold INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS case_tags(
+            case_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, PRIMARY KEY(case_id, tag_id));
+        CREATE TABLE IF NOT EXISTS case_draws(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, case_id INTEGER NOT NULL,
+            tag_id INTEGER NOT NULL, price INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS case_orders(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
+            case_id INTEGER NOT NULL, method TEXT NOT NULL, amount INTEGER NOT NULL,
+            proof TEXT NOT NULL, status TEXT DEFAULT 'pending', tag_id INTEGER, created_at INTEGER NOT NULL);
         """
     )
     for tbl, col in [("tags", "slots INTEGER"), ("prices", "url TEXT"), ("orders", "tag_id INTEGER"),
@@ -93,7 +110,9 @@ def init(owner_id: int):
                      ("tags", "coin_hidden INTEGER DEFAULT 0"),
                      ("tags", "hit INTEGER DEFAULT 0"),        # хит продаж
                      ("tags", "disc_pct INTEGER"),             # скидка на тег, %
-                     ("tags", "disc_until INTEGER")]:          # до какого времени (unix), NULL = бессрочно  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
+                     ("tags", "disc_until INTEGER"), ("cases", "price_rub INTEGER DEFAULT 0"), ("cases", "price_gold INTEGER DEFAULT 0"),
+                     ("case_draws", "game_id TEXT"), ("case_draws", "issue_status TEXT DEFAULT 'not_requested'"),
+                     ("case_draws", "requested_at INTEGER"), ("case_draws", "decided_at INTEGER")]:          # до какого времени (unix), NULL = бессрочно  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -370,3 +389,68 @@ def ref_stats(code):
     paid = one("SELECT COUNT(*) n FROM orders o JOIN ref_visits v ON v.user_id=o.user_id "
                "WHERE v.code=? AND o.status='paid'", (code,))["n"]
     return total, new, paid
+
+
+# ---------- избранное ----------
+FAV_WARN_HOURS = 24  # за сколько часов до конца скидки предупреждать «скоро подорожает»
+
+
+def tag_base_price(tag_id):
+    """Минимальная цена тега в ₽ без скидок (по незакрытым срокам) — для отслеживания подорожания."""
+    r = one("SELECT MIN(price_rub) m FROM prices WHERE tag_id=? AND COALESCE(closed,0)=0", (tag_id,))
+    return r["m"] if r and r["m"] is not None else None
+
+
+def is_fav(uid, tag_id):
+    return one("SELECT 1 FROM favorites WHERE user_id=? AND tag_id=?", (uid, tag_id)) is not None
+
+
+def fav_toggle(uid, tag_id):
+    """Добавляет тег в избранное или убирает. Возвращает True, если теперь в избранном."""
+    if is_fav(uid, tag_id):
+        ex("DELETE FROM favorites WHERE user_id=? AND tag_id=?", (uid, tag_id))
+        return False
+    tg = one("SELECT disc_pct, disc_until FROM tags WHERE id=?", (tag_id,))
+    ex("INSERT OR IGNORE INTO favorites(user_id,tag_id,added_at,last_disc,last_price,end_warned) VALUES(?,?,?,?,?,0)",
+       (uid, tag_id, int(time.time()), disc_of(tg), tag_base_price(tag_id)))
+    return True
+
+
+def fav_tags(uid):
+    return q("SELECT t.* FROM favorites f JOIN tags t ON t.id=f.tag_id WHERE f.user_id=? AND t.hidden=0 "
+             "ORDER BY f.added_at DESC", (uid,))
+
+
+def fav_events():
+    """Проверяет все избранные теги и возвращает список уведомлений [(user_id, tag_row, kind, extra)].
+    kind: discount — появилась/выросла скидка; ending — скидка скоро закончится (тег подорожает);
+    raised — цена выросла; ended — скидка закончилась. Снимок состояния обновляется сразу."""
+    out = []
+    rows = q("SELECT f.user_id, f.last_disc, f.last_price, f.end_warned, t.* FROM favorites f "
+             "JOIN tags t ON t.id=f.tag_id LEFT JOIN users u ON u.user_id=f.user_id "
+             "WHERE t.hidden=0 AND COALESCE(u.banned,0)=0")
+    for r in rows:
+        cur_disc = disc_of(r)
+        left = disc_left(r)
+        base = tag_base_price(r["id"])
+        last_disc = r["last_disc"] or 0
+        last_price = r["last_price"]
+        warned = r["end_warned"] or 0
+        kind = None
+        if cur_disc > last_disc:
+            kind, warned = "discount", 0
+        elif cur_disc and left is not None and left <= FAV_WARN_HOURS * 3600 and not warned:
+            kind, warned = "ending", 1
+        elif base is not None and last_price is not None and base > last_price:
+            kind = "raised"
+        elif last_disc and not cur_disc:
+            kind, warned = "ended", 0
+        if cur_disc and left is not None and left > FAV_WARN_HOURS * 3600:
+            warned = 0
+        if (cur_disc, base, warned) != (last_disc, last_price, r["end_warned"] or 0):
+            _conn.execute("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
+                          (cur_disc, base, warned, r["user_id"], r["id"]))
+        if kind:
+            out.append((r["user_id"], r, kind, {"old": last_price, "new": base, "left": left, "pct": cur_disc}))
+    _conn.commit()
+    return out

@@ -14,6 +14,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import banner
 import db
+import favorites
 import links
 from texts import t
 
@@ -29,6 +30,18 @@ class Order(StatesGroup):
 
 class Ask(StatesGroup):
     question = State()
+
+
+class TagSearch(StatesGroup):
+    query = State()
+
+
+class CasePayment(StatesGroup):
+    proof = State()
+
+
+class CaseIssue(StatesGroup):
+    game_id = State()
 
 
 def esc(s):
@@ -74,12 +87,12 @@ def tag_label(tg):
     """Подпись тега для покупателя: «🔥 [XT]» у хита, «[XT] - 67%» при скидке."""
     pct = db.disc_of(tg)
     name = tg["name"] + (f" - {pct}%" if pct else "")
-    return ("🔥 " if tg["hit"] else "") + name
+    return ("🔴 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
 
 
 def tag_btn(tg, data):
     """Кнопка тега для покупателя: скидка — зелёная, хит — с огоньком, закрытый — с замком."""
-    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style="success" if db.disc_of(tg) else None)
+    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style="success" if db.disc_of(tg) else ("danger" if tg["hit"] else None))
 
 
 def left_str(sec):
@@ -158,8 +171,10 @@ def main_menu():
     row3 = ([btn(g("btn_reviews"), url=rv)] if rv else []) + [btn(g("btn_help"), "menu:help")]
     return kb([
         [btn(g("btn_catalog"), "menu:catalog")],
+        [btn("🔎 Умный поиск тегов", "search:open"), btn("🎁 Кейсы", "cases:list")],
         [btn(g("btn_coins"), "menu:coins"), btn(g("btn_bonus"), "menu:bonus")],
         [btn(g("btn_promo"), "menu:promo"), btn(g("btn_orders"), "menu:orders")],
+        [btn(g("btn_fav"), "menu:fav")],
         row3,
         [btn(g("btn_rules"), "menu:rules")],
     ])
@@ -263,6 +278,164 @@ async def cb_orders(c: CallbackQuery, state: FSMContext):
     await show(c, text, markup, "orders")
 
 
+
+# ---------------- умный поиск ----------------
+@router.callback_query(F.data == "search:open")
+async def search_open(c: CallbackQuery, state: FSMContext):
+    await state.set_state(TagSearch.query)
+    await show(c, "🔎 <b>Умный поиск тегов</b>\n\nВведи параметры через точку с запятой:\n<code>название;мин.цена;макс.цена;мин.длина;макс.длина;скидка;хит</code>\n\nПример: <code>dragon;100;1000;3;12;1;0</code>\nПустое поле означает «любой». Для скидки и хита: 1 — да, 0 — нет.", back_menu())
+
+
+@router.message(TagSearch.query)
+async def search_run(m: Message, state: FSMContext):
+    raw = (m.text or "").strip().split(";")
+    raw += [""] * (7-len(raw))
+    name, lo, hi, lmin, lmax, discount, hit = [x.strip() for x in raw[:7]]
+    try:
+        sql = """SELECT t.*, MIN(p.price_rub) min_price FROM tags t
+                 LEFT JOIN prices p ON p.tag_id=t.id
+                 WHERE t.hidden=0 AND t.closed=0"""
+        args = []
+        if name: sql += " AND lower(t.name) LIKE ?"; args.append("%"+name.lower()+"%")
+        if lo: sql += " AND p.price_rub >= ?"; args.append(int(lo))
+        if hi: sql += " AND p.price_rub <= ?"; args.append(int(hi))
+        if lmin: sql += " AND length(t.name) >= ?"; args.append(int(lmin))
+        if lmax: sql += " AND length(t.name) <= ?"; args.append(int(lmax))
+        if discount == "1": sql += " AND COALESCE(t.disc_pct,0)>0 AND (t.disc_until IS NULL OR t.disc_until>?)"; args.append(int(time.time()))
+        if discount == "0": sql += " AND COALESCE(t.disc_pct,0)=0"
+        if hit in ("0","1"): sql += " AND COALESCE(t.hit,0)=?"; args.append(int(hit))
+        sql += " GROUP BY t.id ORDER BY t.hit DESC, t.id DESC LIMIT 30"
+        rows = db.q(sql, tuple(args))
+    except (ValueError, Exception) as e:
+        await state.clear()
+        return await m.answer("Не удалось разобрать фильтры. Проверь числа и попробуй снова.", reply_markup=back_menu())
+    await state.clear()
+    buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in rows]
+    buttons += [[btn("🔎 Изменить фильтры", "search:open")], [btn(t("btn_menu"), "menu:main")]]
+    await m.answer(f"Найдено тегов: {len(rows)}" if rows else "По заданным фильтрам ничего не найдено.", reply_markup=kb(buttons))
+
+
+# ---------------- кейсы: оплата скриншотом и подтверждение владельцем ----------------
+@router.callback_query(F.data == "cases:list")
+async def cases_list(c: CallbackQuery):
+    cases = db.q("SELECT * FROM cases WHERE active=1 ORDER BY id")
+    rows = [[btn(f"🎁 {x['name']} · {fmt(x['price_rub'])} ₽ / {fmt(x['price_gold'])} голды", f"cases:buy:{x['id']}")] for x in cases]
+    rows += [[btn("🎒 Мои кейсы", "cases:mine")], [btn(t("btn_menu"), "menu:main")]]
+    await show(c, "🎁 <b>Кейсы с тегами</b>\nВыбери кейс и способ оплаты. После проверки скриншота владельцем тег будет выдан автоматически.", kb(rows))
+
+
+@router.callback_query(F.data == "cases:mine")
+async def cases_mine(c: CallbackQuery):
+    rows = db.q("SELECT d.*, c.name case_name, t.name tag_name FROM case_draws d JOIN cases c ON c.id=d.case_id JOIN tags t ON t.id=d.tag_id WHERE d.user_id=? ORDER BY d.id DESC LIMIT 50", (c.from_user.id,))
+    lines, buttons = [], []
+    statuses = {
+        "not_requested": "🟡 Ожидает заявки на выдачу",
+        "pending": "⏳ Заявка отправлена владельцу",
+        "issued": "✅ Тег выдан",
+        "refused": "❌ В выдаче отказано",
+    }
+    for x in rows:
+        lines.append(f"🎁 <b>{esc(x['case_name'])}</b> → <b>{esc(x['tag_name'])}</b>\n{statuses.get(x['issue_status'] or 'not_requested', 'Статус уточняется')}")
+        if (x["issue_status"] or "not_requested") in ("not_requested", "refused"):
+            buttons.append([btn("📨 Подать заявку на выдачу · " + esc(x["tag_name"]), f"cases:issue:{x['id']}")])
+    text = "🎒 <b>Мои кейсы</b>\nЗдесь находятся открытые кейсы и выпавшие теги. Чтобы получить тег в игре, подай заявку на выдачу.\n\n" + ("\n\n".join(lines) if lines else "Пока нет открытых кейсов.")
+    buttons += [[btn("🎁 К кейсам", "cases:list")], [btn(t("btn_menu"), "menu:main")]]
+    await show(c, text, kb(buttons))
+
+
+@router.callback_query(F.data.regexp(r"^cases:issue:\d+$"))
+async def case_issue_start(c: CallbackQuery, state: FSMContext):
+    draw_id = int(c.data.split(":")[2])
+    draw = db.one("SELECT * FROM case_draws WHERE id=? AND user_id=?", (draw_id, c.from_user.id))
+    if not draw:
+        return await c.answer("Кейс не найден", show_alert=True)
+    if (draw["issue_status"] or "not_requested") not in ("not_requested", "refused"):
+        return await c.answer("Заявка уже отправлена или тег уже выдан", show_alert=True)
+    await state.update_data(case_draw_id=draw_id)
+    await state.set_state(CaseIssue.game_id)
+    await show(c, "🆔 <b>Заявка на выдачу тега</b>\n\nОтправь свой игровой ID, на который владелец должен выдать тег:", kb([[btn("↩️ Отмена", "cases:mine")]]))
+
+
+@router.message(CaseIssue.game_id)
+async def case_issue_submit(m: Message, state: FSMContext, bot: Bot):
+    game_id = (m.text or "").strip()
+    if not re.fullmatch(r"\d{5,20}", game_id):
+        return await m.answer("⚠️ ID должен содержать от 5 до 20 цифр. Отправь игровой ID ещё раз.")
+    data = await state.get_data()
+    draw_id = data.get("case_draw_id")
+    draw = db.one("SELECT d.*, c.name case_name, t.name tag_name FROM case_draws d JOIN cases c ON c.id=d.case_id JOIN tags t ON t.id=d.tag_id WHERE d.id=? AND d.user_id=?", (draw_id, m.from_user.id))
+    if not draw or (draw["issue_status"] or "not_requested") not in ("not_requested", "refused"):
+        await state.clear()
+        return await m.answer("Этот кейс уже нельзя отправить на выдачу.", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")]]))
+    db.ex("UPDATE case_draws SET game_id=?, issue_status='pending', requested_at=?, decided_at=NULL WHERE id=? AND user_id=?", (game_id, int(time.time()), draw_id, m.from_user.id))
+    await state.clear()
+    await m.answer("✅ Заявка отправлена владельцу. Когда тег будет выдан или в выдаче будет отказано, я сообщу тебе.", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")]]))
+    username = f"@{m.from_user.username}" if m.from_user.username else "без username"
+    msg = (f"📨 <b>Заявка на выдачу тега из кейса</b>\n"
+           f"Покупатель: {esc(username)}\nTelegram ID: <code>{m.from_user.id}</code>\n"
+           f"Игровой ID: <code>{esc(game_id)}</code>\nКейс: <b>{esc(draw['case_name'])}</b>\n"
+           f"Тег: <b>{esc(draw['tag_name'])}</b>\nID открытия: <code>{draw_id}</code>")
+    markup = kb([[btn("✅ Выдан", f"adm:caseissue:issued:{draw_id}"), btn("❌ Отказан", f"adm:caseissue:refused:{draw_id}")]])
+    for aid in db.admin_ids():
+        try:
+            await bot.send_message(aid, msg, reply_markup=markup)
+        except Exception:
+            pass
+
+
+@router.callback_query(F.data.regexp(r"^cases:buy:\d+$"))
+async def case_buy(c: CallbackQuery):
+    cid = int(c.data.split(":")[2])
+    case = db.one("SELECT * FROM cases WHERE id=? AND active=1", (cid,))
+    if not case:
+        return await c.answer("Кейс недоступен", show_alert=True)
+    pool = db.q("SELECT 1 FROM case_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.case_id=? AND t.hidden=0 AND t.closed=0", (cid,))
+    if not pool:
+        return await c.answer("В кейсе пока нет тегов", show_alert=True)
+    rows = []
+    if int(case["price_rub"] or 0) > 0:
+        rows.append([btn(f"💳 Оплатить {fmt(case['price_rub'])} ₽", f"cases:pay:{cid}:card")])
+    if int(case["price_gold"] or 0) > 0:
+        rows.append([btn(f"🪙 Оплатить {fmt(case['price_gold'])} голды", f"cases:pay:{cid}:gold")])
+    rows.append([btn("↩️ Назад", "cases:list")])
+    await show(c, f"🎁 <b>{esc(case['name'])}</b> · {esc(case['rarity'])}\nВыбери способ оплаты:", kb(rows))
+
+
+@router.callback_query(F.data.regexp(r"^cases:pay:\d+:(card|gold)$"))
+async def case_pay(c: CallbackQuery, state: FSMContext):
+    _, _, cid, method = c.data.split(":")
+    case = db.one("SELECT * FROM cases WHERE id=? AND active=1", (int(cid),))
+    if not case:
+        return await c.answer("Кейс недоступен", show_alert=True)
+    amount = int(case["price_rub"] if method == "card" else case["price_gold"] or 0)
+    if amount <= 0:
+        return await c.answer("Этот способ оплаты не настроен", show_alert=True)
+    await state.update_data(case_id=int(cid), case_method=method, case_amount=amount)
+    await state.set_state(CasePayment.proof)
+    details = db.get_setting("payment_details") if method == "card" else "Переведи указанное количество голды владельцу/по согласованным реквизитам."
+    await show(c, f"Оплати <b>{fmt(amount)} {'₽' if method == 'card' else 'голды'}</b>.\n\n{esc(details)}\n\nЗатем отправь сюда скриншот оплаты.", kb([[btn("↩️ Отмена", "cases:list")]]))
+
+
+@router.message(CasePayment.proof)
+async def case_payment_proof(m: Message, state: FSMContext, bot: Bot):
+    file_id = m.photo[-1].file_id if m.photo else (m.document.file_id if m.document and (m.document.mime_type or "").startswith("image/") else None)
+    if not file_id:
+        return await m.answer("Пришли скриншот оплаты фотографией или изображением-документом.")
+    data = await state.get_data()
+    case = db.one("SELECT * FROM cases WHERE id=? AND active=1", (data.get("case_id"),))
+    if not case:
+        await state.clear(); return await m.answer("Кейс больше недоступен.")
+    oid = db.ex("INSERT INTO case_orders(user_id,username,case_id,method,amount,proof,created_at) VALUES(?,?,?,?,?,?,?)", (m.from_user.id, m.from_user.username, case["id"], data["case_method"], data["case_amount"], file_id, int(time.time())))
+    await state.clear()
+    await m.answer(f"✅ Заказ #{oid} отправлен владельцу на проверку. После подтверждения тег автоматически появится в разделе «Мои кейсы».", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")], [btn("🎁 К кейсам", "cases:list")]]))
+    uname = f"@{m.from_user.username}" if m.from_user.username else str(m.from_user.id)
+    caption = f"🎁 <b>Оплата кейса #{oid}</b>\nКейс: {esc(case['name'])} ({esc(case['rarity'])})\nПокупатель: {esc(uname)} / <code>{m.from_user.id}</code>\nСумма: {fmt(data['case_amount'])} {'₽' if data['case_method']=='card' else 'голды'}"
+    markup = kb([[btn("✅ Подтвердить и выдать тег", f"adm:caseok:{oid}"), btn("❌ Отклонить", f"adm:caseno:{oid}")]])
+    for aid in db.admin_ids():
+        try: await bot.send_photo(aid, file_id, caption=caption, reply_markup=markup)
+        except Exception: pass
+
+
 # ---------------- каталог ----------------
 @router.callback_query(F.data == "menu:catalog")
 async def cb_catalog(c: CallbackQuery, state: FSMContext):
@@ -362,7 +535,7 @@ async def cb_tag(c: CallbackQuery, state: FSMContext):
 
 async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=None, coins_mode=False):
     await state.clear()
-    if coins_mode:  # покупка через «Магазин COINS»: везде только цены в койнах
+    if coins_mode:  # покупка через «Магазин RECOINS»: везде только цены в койнах
         await state.update_data(coins_only=True)
     tag = db.one("SELECT * FROM tags WHERE id=? AND hidden=0", (tid,))
     if not tag:
@@ -402,6 +575,8 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
         banner_rows.append((p["term"], rub, False, gold, stars))
         label = f"{p['term']} | {fmt(rub)}₽" + (f" / {fmt(gold)}г" if gold else "") + (f" / {fmt(stars)}⭐" if stars else "")
         rows.append([btn(label, f"price:{p['id']}")])
+    if not coins_mode:
+        rows.append([btn(t("btn_fav_del") if db.is_fav(c.from_user.id, tid) else t("btn_fav_add"), f"fav:{tid}")])
     if manager_url() and not coins_mode:
         rows.append([btn(t("btn_contact"), url=manager_url())])
     rows.append([btn(t("btn_back"), back_data or f"cat:{tag['category_id']}:0")])
@@ -425,11 +600,49 @@ async def render_tag(c: CallbackQuery, state: FSMContext, tid: int, back_data=No
     gen = None
     if not tag["banner"] and banner_rows:
         try:
-            gen = await make_terms_banner(tag["name"], banner_rows, "COINS" if coins_mode else "₽")
+            gen = await make_terms_banner(tag["name"], banner_rows, "RECOINS" if coins_mode else "₽")
         except Exception:
             logging.exception("Не удалось создать баннер сроков")
     await show(c, text, kb(rows), "terms", fid=tag["banner"] or (None if gen else (tcat["banner"] if tcat else None)),
                gen=gen)
+
+
+@router.callback_query(F.data.regexp(r"^fav:\d+$"))
+async def cb_fav_toggle(c: CallbackQuery, state: FSMContext):
+    tid = int(c.data.split(":")[1])
+    if not db.one("SELECT 1 FROM tags WHERE id=? AND hidden=0", (tid,)):
+        return await c.answer(t("txt_tag_nf"), show_alert=True)
+    db.fav_toggle(c.from_user.id, tid)
+    await render_tag(c, state, tid)
+
+
+@router.callback_query(F.data.regexp(r"^menu:fav(:\d+)?$"))
+async def cb_fav(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    page = int(c.data.split(":")[2]) if c.data.count(":") == 2 else 0
+    tags = db.fav_tags(c.from_user.id)
+    if not tags:
+        return await show(c, t("txt_fav_empty"),
+                          kb([[btn(t("btn_to_catalog"), "menu:catalog")], [btn(t("btn_menu"), "menu:main")]]), "fav")
+    pages = max(1, (len(tags) + PAGE - 1) // PAGE)
+    page = max(0, min(page, pages - 1))
+    rows, line = [], []
+    for tg in tags[page * PAGE:(page + 1) * PAGE]:
+        line.append(tag_btn(tg, f"tag:{tg['id']}"))
+        if len(line) == 2:
+            rows.append(line)
+            line = []
+    if line:
+        rows.append(line)
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(btn("◀️", f"menu:fav:{page - 1}"))
+        if page < pages - 1:
+            nav.append(btn(t("btn_next"), f"menu:fav:{page + 1}"))
+        rows.append(nav)
+    rows.append([btn(t("btn_menu"), "menu:main")])
+    await show(c, t("txt_fav_title", page=page + 1, pages=pages), kb(rows), "fav")
 
 
 @router.callback_query(F.data.regexp(r"^closed:\d+$"))
@@ -551,7 +764,7 @@ def format_details(raw):
 
 
 async def summary_coins(target, state, data, p, pr, rub, user_id, lines):
-    """Сводка заказа из «Магазина COINS»: только цена и оплата койнами."""
+    """Сводка заказа из «Магазина RECOINS»: только цена и оплата койнами."""
     coins = db.coins_for(rub)
     if pr:
         lines.append(t("txt_order_promo", code=esc(pr[0]), pct=pr[1]))
@@ -848,7 +1061,7 @@ async def got_proof(m: Message, state: FSMContext, bot: Bot):
             pass
 
 
-# ---------------- Магазин COINS ----------------
+# ---------------- Магазин RECOINS ----------------
 COIN_ICONS = {"earn": "➕", "spend": "➖", "refund": "↩️", "admin": "🎁", "bonus": "🎁"}
 COIN_WORDS = {"earn": "начислено", "spend": "потрачено", "refund": "возврат", "admin": "от администрации", "bonus": "ежедневный бонус"}
 
@@ -1005,6 +1218,8 @@ async def cb_bonus_claim(c: CallbackQuery, state: FSMContext):
 # ---------------- доступ: бан и режим работ ----------------
 class Gate(BaseMiddleware):
     async def __call__(self, handler, event, data):
+        if data.get("bot"):
+            favorites.ensure_watcher(data["bot"])  # фоновая проверка избранного (запускается один раз)
         u = data.get("event_from_user")
         if u and not db.is_admin(u.id):
             r = db.one("SELECT banned FROM users WHERE user_id=?", (u.id,))
