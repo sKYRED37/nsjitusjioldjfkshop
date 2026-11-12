@@ -123,31 +123,92 @@ async def admin_cases(c: CallbackQuery, state: FSMContext = None):
     cases = db.q("SELECT * FROM cases ORDER BY id DESC")
     rows = [[btn(f"{x['name']} · {x['price_rub']} ₽ / {x['price_gold']} голды", f"adm:caseview:{x['id']}")] for x in cases]
     rows += [[btn("➕ Создать кейс", "adm:caseadd")], back()]
-    await show(c, "🎁 <b>Кейсы</b>\nСоздание: название | редкость | цена ₽ | цена голды | ID тегов", kb(rows))
+    await show(c, "🎁 <b>Кейсы</b>\nСоздание через кнопки: введи название и цены, затем нажимай на теги, чтобы добавить или убрать их из пула.", kb(rows))
 
 
 @router.callback_query(F.data == "adm:caseadd")
 async def admin_case_add(c: CallbackQuery, state: FSMContext):
     await state.set_state(A.case_create)
-    await show(c, "Пришли одной строкой:\n<code>Название | Обычный/Редкий/Легендарный | цена ₽ | цена голды | id_тегов</code>\n\nПример: <code>Золотой | Редкий | 199 | 50 | 1,2,5</code>", kb([back("adm:cases")]))
+    await state.update_data(case_selected=[])
+    await show(c, "Введи название, цену в рублях и цену в голде через |\nПример: <code>Золотой | 199 | 50</code>\nНулём отключается соответствующий способ оплаты.", kb([back("adm:cases")]))
 
 
 @router.message(A.case_create)
 async def admin_case_save(m: Message, state: FSMContext):
     try:
-        name, rarity, rub, gold, ids = [x.strip() for x in (m.text or "").split("|", 4)]
-        if rarity not in ("Обычный", "Редкий", "Легендарный") or int(rub) < 0 or int(gold) < 0 or (int(rub) == 0 and int(gold) == 0):
+        name, rub, gold = [x.strip() for x in (m.text or "").split("|", 2)]
+        if not name or int(rub) < 0 or int(gold) < 0 or (int(rub) == 0 and int(gold) == 0):
             raise ValueError()
-        tag_ids = list(dict.fromkeys(int(x.strip()) for x in ids.split(",") if x.strip()))
-        if not name or not tag_ids or any(not db.one("SELECT id FROM tags WHERE id=?", (tid,)) for tid in tag_ids):
-            raise ValueError()
-        cid = db.ex("INSERT INTO cases(name,rarity,price,active,price_rub,price_gold) VALUES(?,?,0,1,?,?)", (name, rarity, int(rub), int(gold)))
-        for tid in tag_ids:
+    except Exception:
+        return await m.answer("Формат: Название | цена ₽ | цена голды. Например: Золотой | 199 | 50")
+    await state.update_data(case_name=name, case_rub=int(rub), case_gold=int(gold))
+    await state.set_state(A.case_create)
+    await case_pool_view(m, state)
+
+
+async def case_pool_view(target, state):
+    data = await state.get_data()
+    tags = _all_tags()
+    selected = set(data.get("case_selected", []))
+    rows = []
+    cells = []
+    for tg in tags:
+        mark = "☑️ " if tg["id"] in selected else "⬜ "
+        cells.append(btn(mark + tg["name"], f"adm:casepick:{tg['id']}"))
+    rows.extend(_grid(cells))
+    rows.append([btn(f"✅ Создать кейс ({len(selected)} тег.)", "adm:casesave", style="success")])
+    rows.append(back("adm:cases"))
+    text = f"🎁 <b>{esc(data['case_name'])}</b> · {data['case_rub']} ₽ / {data['case_gold']} голды\n\nНажимай на названия тегов: ☑️ — добавлен в пул, ⬜ — не выбран. Можно выбрать несколько."
+    markup = kb(rows)
+    if isinstance(target, Message):
+        await target.answer(text, reply_markup=markup)
+    else:
+        await show(target, text, markup)
+
+
+@router.callback_query(F.data.regexp(r"^adm:casepick:\d+$"))
+async def admin_case_pick(c: CallbackQuery, state: FSMContext):
+    # Не принимаем старые кнопки после выхода из мастера создания кейса.
+    if await state.get_state() != A.case_create.state:
+        return await c.answer("Создание кейса уже завершено. Открой его заново.", show_alert=True)
+    tid = int(c.data.split(":")[2])
+    data = await state.get_data()
+    if not data.get("case_name"):
+        return await c.answer("Сначала введи название и цены кейса.", show_alert=True)
+    selected = set(data.get("case_selected", []))
+    if tid in selected: selected.remove(tid)
+    elif db.one("SELECT id FROM tags WHERE id=?", (tid,)): selected.add(tid)
+    await state.update_data(case_selected=sorted(selected))
+    await case_pool_view(c, state)
+
+
+@router.callback_query(F.data == "adm:casesave")
+async def admin_case_save_buttons(c: CallbackQuery, state: FSMContext):
+    if await state.get_state() != A.case_create.state:
+        return await c.answer("Создание кейса уже завершено. Открой его заново.", show_alert=True)
+    data = await state.get_data()
+    ids = sorted(set(data.get("case_selected", [])))
+    if not data.get("case_name") or data.get("case_rub") is None or data.get("case_gold") is None:
+        return await c.answer("Сначала введи название и цены кейса.", show_alert=True)
+    if not ids:
+        return await c.answer("Сначала выбери хотя бы один тег", show_alert=True)
+    # Повторно проверяем теги перед сохранением: их могли удалить во время создания.
+    valid_ids = {row["id"] for row in db.q(
+        "SELECT id FROM tags WHERE id IN (" + ",".join("?" for _ in ids) + ")", tuple(ids)
+    )}
+    ids = [tid for tid in ids if tid in valid_ids]
+    if not ids:
+        return await c.answer("Выбранные теги больше не существуют. Выбери теги заново.", show_alert=True)
+    cid = db.ex("INSERT INTO cases(name,rarity,price,active,price_rub,price_gold) VALUES(?,?,0,1,?,?)",
+                (data["case_name"], "Обычный", data["case_rub"], data["case_gold"]))
+    try:
+        for tid in ids:
             db.ex("INSERT INTO case_tags(case_id,tag_id) VALUES(?,?)", (cid, tid))
     except Exception:
-        return await m.answer("Формат неверный. Пример: Название | Редкий | 199 | 50 | 1,2,5")
+        db.ex("DELETE FROM cases WHERE id=?", (cid,))
+        raise
     await state.clear()
-    await m.answer(f"✅ Кейс «{esc(name)}» создан. ID: {cid}", reply_markup=kb([[btn("🎁 К кейсам", "adm:cases")], back()]))
+    await show(c, f"✅ Кейс «{esc(data['case_name'])}» создан. Выбрано тегов: {len(ids)}.", kb([[btn("🎁 К кейсам", "adm:cases")]]))
 
 
 @router.callback_query(F.data.regexp(r"^adm:caseview:\d+$"))

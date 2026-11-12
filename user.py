@@ -70,7 +70,7 @@ def kb(rows):
 
 
 # Цвет кнопок: по умолчанию эмодзи 🟢 (скидка) и 🔴 (хит в админке) — работает везде.
-USE_NATIVE_STYLE = False  # True — красить кнопки средствами Telegram (если у тебя новый aiogram и Telegram их принимает)
+USE_NATIVE_STYLE = True  # Используем нативные цвета кнопок, если установленный aiogram их поддерживает.
 STYLE_OK = USE_NATIVE_STYLE and "style" in getattr(InlineKeyboardButton, "model_fields", {})
 _FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
 
@@ -95,7 +95,10 @@ def tag_btn(tg, data):
     # Если одновременно хит и скидка, приоритет красного стиля у хита,
     # а скидка дополнительно отмечается зелёным маркером в подписи.
     style = "danger" if tg["hit"] else ("success" if db.disc_of(tg) else None)
-    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style=style)
+    pct = db.disc_of(tg)
+    # Красный маркер кнопки уже обозначает хит; не дублируем его вторым огоньком.
+    label = (("🟢 " if pct else "") + tg["name"] + (f" - Скидка {pct}%" if pct else ""))
+    return btn(("🔒 " if tg["closed"] else "") + label, data, style=style)
 
 
 def left_str(sec):
@@ -295,23 +298,42 @@ async def search_run(m: Message, state: FSMContext):
     raw += [""] * (7-len(raw))
     name, lo, hi, lmin, lmax, discount, hit = [x.strip() for x in raw[:7]]
     try:
-        sql = """SELECT t.*, MIN(p.price_rub) min_price FROM tags t
-                 LEFT JOIN prices p ON p.tag_id=t.id
+        sql = """SELECT t.*, MIN(p.price_rub) AS min_price
+                 FROM tags t LEFT JOIN prices p ON p.tag_id=t.id
                  WHERE t.hidden=0 AND t.closed=0"""
         args = []
-        if name: sql += " AND lower(t.name) LIKE ?"; args.append("%"+name.lower()+"%")
-        if lo: sql += " AND p.price_rub >= ?"; args.append(int(lo))
-        if hi: sql += " AND p.price_rub <= ?"; args.append(int(hi))
-        if lmin: sql += " AND length(t.name) >= ?"; args.append(int(lmin))
-        if lmax: sql += " AND length(t.name) <= ?"; args.append(int(lmax))
-        if discount == "1": sql += " AND COALESCE(t.disc_pct,0)>0 AND (t.disc_until IS NULL OR t.disc_until>?)"; args.append(int(time.time()))
-        if discount == "0": sql += " AND COALESCE(t.disc_pct,0)=0"
-        if hit in ("0","1"): sql += " AND COALESCE(t.hit,0)=?"; args.append(int(hit))
-        sql += " GROUP BY t.id ORDER BY t.hit DESC, t.id DESC LIMIT 30"
+        if name:
+            sql += " AND lower(t.name) LIKE ?"
+            args.append("%" + name.casefold() + "%")
+        if lmin:
+            if int(lmin) < 0: raise ValueError()
+            sql += " AND length(t.name) >= ?"; args.append(int(lmin))
+        if lmax:
+            if int(lmax) < 0: raise ValueError()
+            sql += " AND length(t.name) <= ?"; args.append(int(lmax))
+        if discount not in ("", "0", "1") or hit not in ("", "0", "1"):
+            raise ValueError()
+        sql += " GROUP BY t.id HAVING 1=1"
+        if lo:
+            if int(lo) < 0: raise ValueError()
+            sql += " AND MIN(p.price_rub) >= ?"; args.append(int(lo))
+        if hi:
+            if int(hi) < 0: raise ValueError()
+            sql += " AND MIN(p.price_rub) <= ?"; args.append(int(hi))
+        if discount == "1":
+            sql += " AND COALESCE(t.disc_pct,0)>0 AND (t.disc_until IS NULL OR t.disc_until>?)"
+            args.append(int(time.time()))
+        elif discount == "0":
+            sql += " AND (COALESCE(t.disc_pct,0)=0 OR (t.disc_until IS NOT NULL AND t.disc_until<=?))"
+            args.append(int(time.time()))
+        if hit in ("0", "1"):
+            sql += " AND COALESCE(t.hit,0)=?"
+            args.append(int(hit))
+        sql += " ORDER BY COALESCE(t.hit,0) DESC, t.id DESC LIMIT 30"
         rows = db.q(sql, tuple(args))
-    except (ValueError, Exception) as e:
+    except (ValueError, TypeError):
         await state.clear()
-        return await m.answer("Не удалось разобрать фильтры. Проверь числа и попробуй снова.", reply_markup=back_menu())
+        return await m.answer("Не удалось разобрать фильтры. Используй числа для цен и длины, а для скидки/хита — 1 или 0.", reply_markup=back_menu())
     await state.clear()
     buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in rows]
     buttons += [[btn("🔎 Изменить фильтры", "search:open")], [btn(t("btn_menu"), "menu:main")]]
