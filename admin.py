@@ -3,15 +3,21 @@ import re
 import secrets
 import time
 import logging
+import os
+import io
+import random
+
+from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile, BufferedInputFile
 
 import db
+import roulette
 from user import esc, fmt, kb, btn, show, send_review_prompt, left_str
 import links
 import texts
@@ -283,57 +289,16 @@ async def admin_case_order_decide(c: CallbackQuery, bot: Bot):
             return await c.answer("В пуле этого кейса нет доступных тегов", show_alert=True)
 
         case = db.one("SELECT name FROM cases WHERE id=?", (order["case_id"],))
-        tag = db.one("SELECT name FROM tags WHERE id=?", (result["tag_id"],))
         case_name = case["name"] if case else "Кейс"
-        tag_name = tag["name"] if tag else "Тег"
-        pool = db.q(
-            """SELECT t.name FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
-               WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
-                 AND (t.slots IS NULL OR t.slots>0)""", (order["case_id"],)
-        )
-        names = [x["name"] for x in pool] or [tag_name]
-        frames = [names[(i * 3 + order_id) % len(names)] for i in range(8)]
-        frames[-1] = tag_name
         try:
-            msg = await bot.send_message(
+            await bot.send_message(
                 order["user_id"],
-                f"🎰 <b>Открываем кейс «{esc(case_name)}»...</b>\n\n"
-                f"          🔻\n╔════════════════════╗\n        🎁 <b>{esc(frames[0])}</b>\n"
-                f"╚════════════════════╝\n          🔺"
+                f"✅ Оплата кейса «{esc(case_name)}» подтверждена!\n\n"
+                f"🎒 Кейс добавлен в раздел «Мои кейсы». Открой его самостоятельно нажатием кнопки в этом разделе."
             )
-            for i, name in enumerate(frames[1:], 1):
-                await asyncio.sleep(0.12 + i * 0.055)
-                try:
-                    await msg.edit_text(
-                        f"🎰 <b>Открытие кейса «{esc(case_name)}»</b>\n\n"
-                        f"          🔻\n╔════════════════════╗\n        "
-                        f"{'✨' if i == len(frames)-1 else '🎁'} <b>{esc(name)}</b>\n"
-                        f"╚════════════════════╝\n          🔺"
-                    )
-                except Exception as exc:
-                    logging.info("Кадр рулетки не обновлён: %s", exc)
-                    break
-            try:
-                await msg.edit_text(
-                    f"🎉 <b>ПОЗДРАВЛЯЕМ!</b> 🎉\n\n"
-                    f"В кейсе «{esc(case_name)}» выпал тег:\n"
-                    f"🏆 <b>{esc(tag_name)}</b>\n\n"
-                    f"Результат сохранён в «🎒 Мои кейсы». Чтобы получить тег в игре, подай заявку на выдачу."
-                )
-            except Exception:
-                pass
         except Exception:
-            logging.exception("Не удалось показать рулетку пользователю %s", order["user_id"])
-            try:
-                await bot.send_message(
-                    order["user_id"],
-                    f"🎉 Оплата кейса «{esc(case_name)}» подтверждена!\n"
-                    f"Тебе выпал тег: 🏆 <b>{esc(tag_name)}</b>. "
-                    f"Результат сохранён в разделе «🎒 Мои кейсы»."
-                )
-            except Exception:
-                logging.exception("Не удалось отправить результат кейса пользователю")
-        result_text = f"\n\n✅ Подтверждено. Выпал тег: {esc(tag_name)} (открытие #{result['draw_id']})"
+            logging.exception("Не удалось уведомить пользователя о подтверждении кейса")
+        result_text = f"\n\n✅ Подтверждено. Кейс добавлен покупателю в «Мои кейсы» (позиция #{result['inventory_id']})."
     else:
         changed = db.reject_case_order(order_id)
         if not changed:

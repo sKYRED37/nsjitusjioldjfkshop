@@ -14,6 +14,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import banner
 import db
+import roulette
 import favorites
 import links
 from texts import t
@@ -489,10 +490,26 @@ async def cases_list(c: CallbackQuery):
 
 @router.callback_query(F.data == "cases:mine")
 async def cases_mine(c: CallbackQuery):
-    rows = db.q("SELECT d.*, c.name case_name, t.name tag_name FROM case_draws d JOIN cases c ON c.id=d.case_id JOIN tags t ON t.id=d.tag_id WHERE d.user_id=? ORDER BY d.id DESC LIMIT 50", (c.from_user.id,))
+    inventory = db.q(
+        "SELECT i.*, cs.name case_name FROM case_inventory i JOIN cases cs ON cs.id=i.case_id "
+        "WHERE i.user_id=? AND i.opened_at IS NULL ORDER BY i.id DESC LIMIT 50",
+        (c.from_user.id,)
+    )
+    rows = db.q(
+        "SELECT d.*, c.name case_name, t.name tag_name FROM case_draws d "
+        "JOIN cases c ON c.id=d.case_id JOIN tags t ON t.id=d.tag_id "
+        "WHERE d.user_id=? ORDER BY d.id DESC LIMIT 50", (c.from_user.id,)
+    )
     lines, buttons = [], []
+    if inventory:
+        lines.append("<b>📦 Неоткрытые кейсы</b>")
+        for item in inventory:
+            lines.append(f"🎁 <b>{esc(item['case_name'])}</b> · готов к открытию")
+            buttons.append([btn(f"🎰 Открыть · {esc(item['case_name'])}", f"cases:open:{item['id']}")])
+    if rows:
+        lines.append("<b>🏆 Выпавшие теги</b>")
     statuses = {
-        "not_requested": "🟡 Ожидает заявки на выдачу",
+        "not_requested": "🟡 Можно подать заявку на выдачу",
         "pending": "⏳ Заявка отправлена владельцу",
         "issued": "✅ Тег выдан",
         "refused": "❌ В выдаче отказано",
@@ -501,9 +518,36 @@ async def cases_mine(c: CallbackQuery):
         lines.append(f"🎁 <b>{esc(x['case_name'])}</b> → <b>{esc(x['tag_name'])}</b>\n{statuses.get(x['issue_status'] or 'not_requested', 'Статус уточняется')}")
         if (x["issue_status"] or "not_requested") in ("not_requested", "refused"):
             buttons.append([btn("📨 Подать заявку на выдачу · " + esc(x["tag_name"]), f"cases:issue:{x['id']}")])
-    text = "🎒 <b>Мои кейсы</b>\nЗдесь находятся открытые кейсы и выпавшие теги. Чтобы получить тег в игре, подай заявку на выдачу.\n\n" + ("\n\n".join(lines) if lines else "Пока нет открытых кейсов.")
+    text = "🎒 <b>Мои кейсы</b>\nЗдесь отображаются купленные кейсы. Нажми «Открыть», чтобы запустить рулетку.\n\n" + ("\n\n".join(lines) if lines else "Пока нет купленных кейсов.")
     buttons += [[btn("🎁 К кейсам", "cases:list")], [btn(t("btn_menu"), "menu:main")]]
     await show(c, text, kb(buttons))
+
+
+@router.callback_query(F.data.regexp(r"^cases:open:\d+$"))
+async def case_inventory_open(c: CallbackQuery, bot: Bot):
+    inventory_id = int(c.data.split(":")[2])
+    try:
+        result = db.open_case_inventory(inventory_id, c.from_user.id)
+    except Exception:
+        logging.exception("Ошибка открытия кейса inventory_id=%s", inventory_id)
+        return await c.answer("Не удалось открыть кейс. Попробуй ещё раз.", show_alert=True)
+    if not result:
+        return await c.answer("Этот кейс уже открыт или не найден", show_alert=True)
+    if result.get("error") == "empty_pool":
+        return await c.answer("В кейсе сейчас нет доступных тегов. Напиши владельцу.", show_alert=True)
+    await c.answer("🎰 Кейс открывается!")
+    try:
+        animation = roulette._roulette_gif(result["case_name"], result["pool_names"], result["tag_name"])
+        await bot.send_animation(c.from_user.id, animation=animation,
+                                 caption=f"🎰 <b>Открываем кейс «{esc(result['case_name'])}»!</b>")
+    except Exception:
+        logging.exception("Не удалось отправить GIF рулетки")
+    await bot.send_message(
+        c.from_user.id,
+        f"🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\nВ кейсе «{esc(result['case_name'])}» выпал тег:\n"
+        f"🏆 <b>{esc(result['tag_name'])}</b>\n\nРезультат сохранён в «🎒 Мои кейсы».",
+        reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")]])
+    )
 
 
 @router.callback_query(F.data.regexp(r"^cases:issue:\d+$"))
@@ -590,7 +634,7 @@ async def case_payment_proof(m: Message, state: FSMContext, bot: Bot):
         await state.clear(); return await m.answer("Кейс больше недоступен.")
     oid = db.ex("INSERT INTO case_orders(user_id,username,case_id,method,amount,proof,created_at) VALUES(?,?,?,?,?,?,?)", (m.from_user.id, m.from_user.username, case["id"], data["case_method"], data["case_amount"], file_id, int(time.time())))
     await state.clear()
-    await m.answer(f"✅ Заказ #{oid} отправлен владельцу на проверку. После подтверждения тег автоматически появится в разделе «Мои кейсы».", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")], [btn("🎁 К кейсам", "cases:list")]]))
+    await m.answer(f"✅ Заказ #{oid} отправлен владельцу на проверку. После подтверждения кейс появится в «Мои кейсы», и ты сможешь открыть его сам.", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")], [btn("🎁 К кейсам", "cases:list")]]))
     uname = f"@{m.from_user.username}" if m.from_user.username else str(m.from_user.id)
     caption = f"🎁 <b>Оплата кейса #{oid}</b>\nКейс: {esc(case['name'])} ({esc(case['rarity'])})\nПокупатель: {esc(uname)} / <code>{m.from_user.id}</code>\nСумма: {fmt(data['case_amount'])} {'₽' if data['case_method']=='card' else 'голды'}"
     markup = kb([[btn("✅ Подтвердить и выдать тег", f"adm:caseok:{oid}"), btn("❌ Отклонить", f"adm:caseno:{oid}")]])

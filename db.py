@@ -49,8 +49,7 @@ def ex(sql, args=()):
 
 
 def claim_case_order(order_id: int):
-    """Атомарно подтверждает заказ кейса и фиксирует серверный результат."""
-    import random
+    """Подтверждает оплату и помещает неоткрытый кейс в инвентарь покупателя."""
     _conn.execute("BEGIN IMMEDIATE")
     try:
         order = _conn.execute(
@@ -60,31 +59,73 @@ def claim_case_order(order_id: int):
             _conn.commit()
             return None
         pool = _conn.execute(
-            """SELECT t.id FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
+            """SELECT 1 FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
                WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0
                  AND COALESCE(t.closed,0)=0
-                 AND (t.slots IS NULL OR t.slots>0)""",
+                 AND (t.slots IS NULL OR t.slots>0) LIMIT 1""",
             (order["case_id"],)
-        ).fetchall()
+        ).fetchone()
         if not pool:
             _conn.commit()
             return {"error": "empty_pool"}
-        chosen_id = int(random.choice(pool)["id"])
         cur = _conn.execute(
-            "UPDATE case_orders SET status='paid',tag_id=? WHERE id=? AND status='pending'",
-            (chosen_id, int(order_id))
+            "UPDATE case_orders SET status='paid' WHERE id=? AND status='pending'",
+            (int(order_id),)
         )
         if cur.rowcount != 1:
             _conn.rollback()
             return None
+        cur = _conn.execute(
+            "INSERT INTO case_inventory(user_id,case_id,price,created_at) VALUES(?,?,?,?)",
+            (order["user_id"], order["case_id"], order["amount"], int(time.time()))
+        )
+        inventory_id = cur.lastrowid
+        _conn.commit()
+        return {"order": order, "inventory_id": inventory_id}
+    except Exception:
+        _conn.rollback()
+        raise
+
+
+def open_case_inventory(inventory_id: int, user_id: int):
+    """Атомарно открывает купленный кейс и фиксирует единственный результат."""
+    _conn.execute("BEGIN IMMEDIATE")
+    try:
+        item = _conn.execute(
+            "SELECT * FROM case_inventory WHERE id=? AND user_id=? AND opened_at IS NULL",
+            (int(inventory_id), int(user_id))
+        ).fetchone()
+        if not item:
+            _conn.commit()
+            return None
+        pool = _conn.execute(
+            """SELECT t.id, t.name FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
+               WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
+                 AND (t.slots IS NULL OR t.slots>0) ORDER BY t.id""",
+            (item["case_id"],)
+        ).fetchall()
+        if not pool:
+            _conn.commit()
+            return {"error": "empty_pool"}
+        chosen = random.choice(pool)
         now = int(time.time())
         cur = _conn.execute(
             "INSERT INTO case_draws(user_id,case_id,tag_id,price,created_at) VALUES(?,?,?,?,?)",
-            (order["user_id"], order["case_id"], chosen_id, order["amount"], now)
+            (int(user_id), item["case_id"], int(chosen["id"]), item["price"], now)
         )
         draw_id = cur.lastrowid
+        cur = _conn.execute(
+            "UPDATE case_inventory SET opened_at=?,draw_id=? WHERE id=? AND user_id=? AND opened_at IS NULL",
+            (now, draw_id, int(inventory_id), int(user_id))
+        )
+        if cur.rowcount != 1:
+            _conn.rollback()
+            return None
+        case = _conn.execute("SELECT name FROM cases WHERE id=?", (item["case_id"],)).fetchone()
         _conn.commit()
-        return {"order": order, "tag_id": chosen_id, "draw_id": draw_id}
+        return {"inventory": item, "tag_id": int(chosen["id"]), "tag_name": chosen["name"],
+                "case_name": case["name"] if case else "Кейс", "draw_id": draw_id,
+                "pool_names": [x["name"] for x in pool]}
     except Exception:
         _conn.rollback()
         raise
@@ -153,6 +194,11 @@ def init(owner_id: int):
         CREATE TABLE IF NOT EXISTS case_draws(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, case_id INTEGER NOT NULL,
             tag_id INTEGER NOT NULL, price INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS case_inventory(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, case_id INTEGER NOT NULL,
+            price INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+            opened_at INTEGER, draw_id INTEGER);
+        CREATE INDEX IF NOT EXISTS idx_case_inventory_user ON case_inventory(user_id, opened_at);
         CREATE TABLE IF NOT EXISTS case_orders(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
             case_id INTEGER NOT NULL, method TEXT NOT NULL, amount INTEGER NOT NULL,
