@@ -177,11 +177,12 @@ def main_menu():
     rv = reviews_link()
     row3 = ([btn(g("btn_reviews"), url=rv)] if rv else []) + [btn(g("btn_help"), "menu:help")]
     return kb([
+        # Главная витрина — отдельная центральная кнопка на всю ширину.
         [btn(g("btn_catalog"), "menu:catalog")],
-        [btn("🎁 Кейсы", "cases:list")],
+        # Остальные разделы — аккуратная сетка по две кнопки в строке.
+        [btn("🎁 Кейсы", "cases:list"), btn(g("btn_fav"), "menu:fav")],
         [btn(g("btn_coins"), "menu:coins"), btn(g("btn_bonus"), "menu:bonus")],
         [btn(g("btn_promo"), "menu:promo"), btn(g("btn_orders"), "menu:orders")],
-        [btn(g("btn_fav"), "menu:fav")],
         row3,
         [btn(g("btn_rules"), "menu:rules")],
     ])
