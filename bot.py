@@ -16,8 +16,7 @@ import time
 # │ нужно ничего менять (и не используй «найти и заменить» по файлу!).            │
 # │ Если строка пустая — токен берётся из переменной BOT_TOKEN или token.txt.     │
 # └─────────────────────────────────────────────────────────────────────────────┘
-TOKEN = "8944799493:AAFP877ZqvSqYd-lw0XP-yTnMjnlGSAk7to"
-
+TOKEN = ""
 HERE = os.path.dirname(os.path.abspath(__file__))
 os.chdir(HERE)
 sys.path.insert(0, HERE)

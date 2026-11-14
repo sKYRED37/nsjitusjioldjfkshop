@@ -2,6 +2,7 @@ import asyncio
 import re
 import secrets
 import time
+import logging
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
@@ -261,34 +262,96 @@ async def admin_case_issue_decide(c: CallbackQuery, bot: Bot):
     await c.answer("Решение сохранено")
 
 
-# ---------------- проверка оплаты кейсов ----------------
-@router.callback_query(F.data.regexp(r"^adm:case(ok|no):\d+$"))
+# ---------------- проверка оплаты кейсов --@router.callback_query(F.data.regexp(r"^adm:case(ok|no):\d+$"))
 async def admin_case_order_decide(c: CallbackQuery, bot: Bot):
     _, action, oid = c.data.split(":")
-    order = db.one("SELECT * FROM case_orders WHERE id=?", (int(oid),))
+    order_id = int(oid)
+    order = db.one("SELECT * FROM case_orders WHERE id=?", (order_id,))
     if not order or order["status"] != "pending":
         return await c.answer("Заказ уже обработан или не найден", show_alert=True)
+
     if action == "caseok":
-        pool = db.q("SELECT t.id FROM case_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.case_id=? AND t.hidden=0 AND t.closed=0", (order["case_id"],))
-        if not pool:
-            return await c.answer("В пуле кейса нет доступных тегов", show_alert=True)
-        import random
-        chosen = random.choice(pool)
-        db.ex("UPDATE case_orders SET status='paid',tag_id=? WHERE id=? AND status='pending'", (chosen["id"], order["id"]))
+        try:
+            result = db.claim_case_order(order_id)
+        except Exception:
+            logging.exception("Не удалось подтвердить заказ кейса %s", order_id)
+            return await c.answer("Ошибка сохранения результата. Попробуй ещё раз.", show_alert=True)
+        if not result:
+            return await c.answer("Заказ уже обработан другим администратором", show_alert=True)
+        if result.get("error") == "empty_pool":
+            return await c.answer("В пуле этого кейса нет доступных тегов", show_alert=True)
+
         case = db.one("SELECT name FROM cases WHERE id=?", (order["case_id"],))
-        tag = db.one("SELECT name FROM tags WHERE id=?", (chosen["id"],))
-        db.ex("INSERT INTO case_draws(user_id,case_id,tag_id,price,created_at) VALUES(?,?,?,?,?)", (order["user_id"], order["case_id"], chosen["id"], order["amount"], int(time.time())))
-        try: await bot.send_message(order["user_id"], f"🎉 Оплата кейса «{esc(case['name'])}» подтверждена!\nТебе выпал тег: <b>{esc(tag['name'])}</b>.\nОн сохранён в разделе «🎒 Мои кейсы».")
-        except Exception: pass
-        result = f"\n\n✅ Подтверждено. Выдан тег: {esc(tag['name'])}"
+        tag = db.one("SELECT name FROM tags WHERE id=?", (result["tag_id"],))
+        case_name = case["name"] if case else "Кейс"
+        tag_name = tag["name"] if tag else "Тег"
+        pool = db.q(
+            """SELECT t.name FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
+               WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
+                 AND (t.slots IS NULL OR t.slots>0)""", (order["case_id"],)
+        )
+        names = [x["name"] for x in pool] or [tag_name]
+        frames = [names[(i * 3 + order_id) % len(names)] for i in range(8)]
+        frames[-1] = tag_name
+        try:
+            msg = await bot.send_message(
+                order["user_id"],
+                f"🎰 <b>Открываем кейс «{esc(case_name)}»...</b>\n\n"
+                f"          🔻\n╔════════════════════╗\n        🎁 <b>{esc(frames[0])}</b>\n"
+                f"╚════════════════════╝\n          🔺"
+            )
+            for i, name in enumerate(frames[1:], 1):
+                await asyncio.sleep(0.12 + i * 0.055)
+                try:
+                    await msg.edit_text(
+                        f"🎰 <b>Открытие кейса «{esc(case_name)}»</b>\n\n"
+                        f"          🔻\n╔════════════════════╗\n        "
+                        f"{'✨' if i == len(frames)-1 else '🎁'} <b>{esc(name)}</b>\n"
+                        f"╚════════════════════╝\n          🔺"
+                    )
+                except Exception as exc:
+                    logging.info("Кадр рулетки не обновлён: %s", exc)
+                    break
+            try:
+                await msg.edit_text(
+                    f"🎉 <b>ПОЗДРАВЛЯЕМ!</b> 🎉\n\n"
+                    f"В кейсе «{esc(case_name)}» выпал тег:\n"
+                    f"🏆 <b>{esc(tag_name)}</b>\n\n"
+                    f"Результат сохранён в «🎒 Мои кейсы». Чтобы получить тег в игре, подай заявку на выдачу."
+                )
+            except Exception:
+                pass
+        except Exception:
+            logging.exception("Не удалось показать рулетку пользователю %s", order["user_id"])
+            try:
+                await bot.send_message(
+                    order["user_id"],
+                    f"🎉 Оплата кейса «{esc(case_name)}» подтверждена!\n"
+                    f"Тебе выпал тег: 🏆 <b>{esc(tag_name)}</b>. "
+                    f"Результат сохранён в разделе «🎒 Мои кейсы»."
+                )
+            except Exception:
+                logging.exception("Не удалось отправить результат кейса пользователю")
+        result_text = f"\n\n✅ Подтверждено. Выпал тег: {esc(tag_name)} (открытие #{result['draw_id']})"
     else:
-        db.ex("UPDATE case_orders SET status='rejected' WHERE id=? AND status='pending'", (order["id"],))
-        try: await bot.send_message(order["user_id"], f"❌ Оплата кейса #{order['id']} отклонена владельцем. Если это ошибка, свяжись с поддержкой.")
-        except Exception: pass
-        result = "\n\n❌ Оплата отклонена"
-    try: await c.message.edit_caption((c.message.caption or "") + result, reply_markup=None)
-    except Exception: pass
+        changed = db.reject_case_order(order_id)
+        if not changed:
+            return await c.answer("Заказ уже обработан", show_alert=True)
+        try:
+            await bot.send_message(order["user_id"], f"❌ Оплата кейса #{order_id} отклонена владельцем. Если это ошибка, свяжись с поддержкой.")
+        except Exception:
+            logging.exception("Не удалось уведомить пользователя об отклонении оплаты")
+        result_text = "\n\n❌ Оплата отклонена"
+    try:
+        await c.message.edit_caption((c.message.caption or "") + result_text, reply_markup=None)
+    except Exception:
+        try:
+            await c.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            logging.info("Не удалось обновить сообщение администратора по заказу кейса %s", order_id)
     await c.answer("Решение сохранено")
+
+
 
 
 # ---------------- заказы ----------------

@@ -46,6 +46,65 @@ def ex(sql, args=()):
     return cur.lastrowid
 
 
+
+
+def claim_case_order(order_id: int):
+    """Атомарно подтверждает заказ кейса и фиксирует серверный результат."""
+    import random
+    _conn.execute("BEGIN IMMEDIATE")
+    try:
+        order = _conn.execute(
+            "SELECT * FROM case_orders WHERE id=? AND status='pending'", (int(order_id),)
+        ).fetchone()
+        if not order:
+            _conn.commit()
+            return None
+        pool = _conn.execute(
+            """SELECT t.id FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
+               WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0
+                 AND COALESCE(t.closed,0)=0
+                 AND (t.slots IS NULL OR t.slots>0)""",
+            (order["case_id"],)
+        ).fetchall()
+        if not pool:
+            _conn.commit()
+            return {"error": "empty_pool"}
+        chosen_id = int(random.choice(pool)["id"])
+        cur = _conn.execute(
+            "UPDATE case_orders SET status='paid',tag_id=? WHERE id=? AND status='pending'",
+            (chosen_id, int(order_id))
+        )
+        if cur.rowcount != 1:
+            _conn.rollback()
+            return None
+        now = int(time.time())
+        cur = _conn.execute(
+            "INSERT INTO case_draws(user_id,case_id,tag_id,price,created_at) VALUES(?,?,?,?,?)",
+            (order["user_id"], order["case_id"], chosen_id, order["amount"], now)
+        )
+        draw_id = cur.lastrowid
+        _conn.commit()
+        return {"order": order, "tag_id": chosen_id, "draw_id": draw_id}
+    except Exception:
+        _conn.rollback()
+        raise
+
+
+def reject_case_order(order_id: int) -> bool:
+    """Атомарно отклоняет только ещё ожидающий заказ."""
+    _conn.execute("BEGIN IMMEDIATE")
+    try:
+        cur = _conn.execute(
+            "UPDATE case_orders SET status='rejected' WHERE id=? AND status='pending'",
+            (int(order_id),)
+        )
+        _conn.commit()
+        return cur.rowcount == 1
+    except Exception:
+        _conn.rollback()
+        raise
+
+
 def init(owner_id: int):
     _conn.executescript(
         """

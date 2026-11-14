@@ -34,6 +34,7 @@ class Ask(StatesGroup):
 
 class TagSearch(StatesGroup):
     query = State()
+    mode = State()
 
 
 class CasePayment(StatesGroup):
@@ -285,59 +286,119 @@ async def cb_orders(c: CallbackQuery, state: FSMContext):
 
 
 
-# ---------------- умный поиск ----------------
+# ---------------- поиск тегов в каталоге ----------------
+def catalog_search_menu():
+    return kb([
+        [btn("🔤 По названию", "search:mode:name")],
+        [btn("💰 По цене", "search:mode:price")],
+        [btn("📅 По дням", "search:mode:days")],
+        [btn("↩️ Вернуться в каталог", "menu:catalog")],
+    ])
+
+
 @router.callback_query(F.data == "search:open")
 async def search_open(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(TagSearch.mode)
+    await show(c, "🔎 <b>Поиск тега</b>\\nВыбери способ поиска:", catalog_search_menu())
+
+
+@router.callback_query(F.data.regexp(r"^search:mode:(name|price|days)$"))
+async def search_mode(c: CallbackQuery, state: FSMContext):
+    mode = c.data.rsplit(":", 1)[1]
+    prompts = {
+        "name": "🔤 Введи название тега или его часть:",
+        "price": "💰 Введи максимальную цену в рублях (целое положительное число):",
+        "days": "📅 Введи срок: например 30, 90, 180 или «месяц»:",
+    }
+    await state.clear()
+    await state.update_data(search_mode=mode)
     await state.set_state(TagSearch.query)
-    await show(c, "🔎 <b>Умный поиск тегов</b>\n\nВведи параметры через точку с запятой:\n<code>название;мин.цена;макс.цена;мин.длина;макс.длина;скидка;хит</code>\n\nПример: <code>dragon;100;1000;3;12;1;0</code>\nПустое поле означает «любой». Для скидки и хита: 1 — да, 0 — нет.", back_menu())
+    await show(c, prompts[mode], kb([[btn("✖️ Отменить поиск", "search:cancel")],
+                                     [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
+
+
+@router.callback_query(F.data == "search:cancel")
+async def search_cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(c, "Поиск отменён.", kb([[btn("🔎 Искать ещё", "search:open")],
+                                         [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
 
 
 @router.message(TagSearch.query)
 async def search_run(m: Message, state: FSMContext):
-    raw = (m.text or "").strip().split(";")
-    raw += [""] * (7-len(raw))
-    name, lo, hi, lmin, lmax, discount, hit = [x.strip() for x in raw[:7]]
+    data = await state.get_data()
+    mode = data.get("search_mode")
+    raw = (m.text or "").strip()
+    if not raw:
+        return await m.answer("Введи непустое значение или отмени поиск.")
     try:
-        sql = """SELECT t.*, MIN(p.price_rub) AS min_price
-                 FROM tags t LEFT JOIN prices p ON p.tag_id=t.id
-                 WHERE t.hidden=0 AND t.closed=0"""
+        sql = """SELECT t.* FROM tags t
+                 WHERE COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
+                   AND (t.slots IS NULL OR t.slots>0)
+                   AND EXISTS (SELECT 1 FROM prices available
+                               WHERE available.tag_id=t.id AND COALESCE(available.closed,0)=0
+                                 AND (COALESCE(available.price_rub,0)>0
+                                   OR COALESCE(available.price_gold,0)>0
+                                   OR COALESCE(available.price_stars,0)>0
+                                   OR COALESCE(available.price_boosts,0)>0
+                                   OR COALESCE(available.coins,0)>0))"""
         args = []
-        if name:
-            sql += " AND lower(t.name) LIKE ?"
-            args.append("%" + name.casefold() + "%")
-        if lmin:
-            if int(lmin) < 0: raise ValueError()
-            sql += " AND length(t.name) >= ?"; args.append(int(lmin))
-        if lmax:
-            if int(lmax) < 0: raise ValueError()
-            sql += " AND length(t.name) <= ?"; args.append(int(lmax))
-        if discount not in ("", "0", "1") or hit not in ("", "0", "1"):
-            raise ValueError()
-        sql += " GROUP BY t.id HAVING 1=1"
-        if lo:
-            if int(lo) < 0: raise ValueError()
-            sql += " AND MIN(p.price_rub) >= ?"; args.append(int(lo))
-        if hi:
-            if int(hi) < 0: raise ValueError()
-            sql += " AND MIN(p.price_rub) <= ?"; args.append(int(hi))
-        if discount == "1":
-            sql += " AND COALESCE(t.disc_pct,0)>0 AND (t.disc_until IS NULL OR t.disc_until>?)"
-            args.append(int(time.time()))
-        elif discount == "0":
-            sql += " AND (COALESCE(t.disc_pct,0)=0 OR (t.disc_until IS NOT NULL AND t.disc_until<=?))"
-            args.append(int(time.time()))
-        if hit in ("0", "1"):
-            sql += " AND COALESCE(t.hit,0)=?"
-            args.append(int(hit))
-        sql += " ORDER BY COALESCE(t.hit,0) DESC, t.id DESC LIMIT 30"
+        name_filter = None
+        if mode == "name":
+            # SQLite lower() без ICU не приводит кириллицу к нижнему регистру.
+            # Сравниваем через Unicode casefold в Python.
+            name_filter = raw.casefold()
+        elif mode == "price":
+            price = int(raw.replace(" ", "").replace(",", ""))
+            if price <= 0 or price > 10**9:
+                raise ValueError()
+            sql += """ AND EXISTS (SELECT 1 FROM prices p WHERE p.tag_id=t.id
+                       AND COALESCE(p.closed,0)=0 AND p.price_rub>0
+                       AND CAST(p.price_rub * (100 - CASE
+                           WHEN COALESCE(t.disc_pct,0)>0
+                            AND (t.disc_until IS NULL OR t.disc_until>?) THEN t.disc_pct
+                           ELSE 0 END) / 100 AS INTEGER) <= ?)"""
+            args.extend((int(time.time()), price))
+        elif mode == "days":
+            q = raw.casefold().strip()
+            if q in ("месяц", "месяца", "месяцев"):
+                days = 30
+            else:
+                match = re.search(r"\\d+", q)
+                if not match:
+                    raise ValueError()
+                days = int(match.group())
+                if "месяц" in q:
+                    days *= 30
+            if days <= 0 or days > 36500:
+                raise ValueError()
+            sql += """ AND EXISTS (SELECT 1 FROM prices p WHERE p.tag_id=t.id
+                       AND COALESCE(p.closed,0)=0
+                       AND (CAST(p.term AS TEXT) LIKE ?
+                            OR (lower(p.term) LIKE '%месяц%' AND ? BETWEEN 28 AND 31)
+                            OR (lower(p.term) LIKE '%месяц%'
+                                AND CAST(p.term AS INTEGER)*30=?)))"""
+            args.extend((f"%{days}%", days, days))
+        else:
+            await state.clear()
+            return await m.answer("Сессия поиска устарела. Начни поиск заново.",
+                                  reply_markup=kb([[btn("🔎 Искать ещё", "search:open")],
+                                                   [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
+        sql += " ORDER BY t.id DESC" + ("" if mode == "name" else " LIMIT 50")
         rows = db.q(sql, tuple(args))
+        if name_filter is not None:
+            rows = [row for row in rows if name_filter in row["name"].casefold()][:50]
     except (ValueError, TypeError):
-        await state.clear()
-        return await m.answer("Не удалось разобрать фильтры. Используй числа для цен и длины, а для скидки/хита — 1 или 0.", reply_markup=back_menu())
+        return await m.answer("Некорректный ввод. Для цены и срока используй положительное число, либо «месяц». Попробуй ещё раз.",
+                              reply_markup=kb([[btn("✖️ Отменить поиск", "search:cancel")]]))
     await state.clear()
     buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in rows]
-    buttons += [[btn("🔎 Изменить фильтры", "search:open")], [btn(t("btn_menu"), "menu:main")]]
-    await m.answer(f"Найдено тегов: {len(rows)}" if rows else "По заданным фильтрам ничего не найдено.", reply_markup=kb(buttons))
+    buttons += [[btn("🔎 Искать ещё", "search:open")],
+                [btn("↩️ Вернуться в каталог", "menu:catalog")]]
+    await m.answer((f"🔎 Найдено тегов: {len(rows)}" if rows else
+                    "По этому запросу нет доступных тегов или предложений."),
+                   reply_markup=kb(buttons))
 
 
 # ---------------- кейсы: оплата скриншотом и подтверждение владельцем ----------------
@@ -470,6 +531,7 @@ async def cb_catalog(c: CallbackQuery, state: FSMContext):
     for cat in cats:
         n = db.one("SELECT COUNT(*) n FROM tags WHERE category_id=? AND hidden=0", (cat["id"],))["n"]
         rows.append([btn(f"{cat['name']} ({n})", f"cat:{cat['id']}:0")])
+    rows.append([btn("🔎 Поиск тега", "search:open")])
     rows.append([btn(t("btn_menu"), "menu:main")])
     await show(c, t("txt_catalog") if cats else t("txt_catalog_empty"), kb(rows), "catalog")
 
