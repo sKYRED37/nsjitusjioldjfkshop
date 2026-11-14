@@ -74,7 +74,7 @@ def kb(rows):
 # Цвет кнопок: по умолчанию эмодзи 🟢 (скидка) и 🔴 (хит в админке) — работает везде.
 USE_NATIVE_STYLE = True  # Используем нативные цвета кнопок, если установленный aiogram их поддерживает.
 STYLE_OK = USE_NATIVE_STYLE and "style" in getattr(InlineKeyboardButton, "model_fields", {})
-_FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
+_FALLBACK_EMOJI = {"success": "", "danger": ""}
 
 
 def btn(text, data=None, url=None, style=None):
@@ -93,9 +93,9 @@ def tag_label(tg):
 
 
 def tag_btn(tg, data):
-    """Кнопка тега: скидка отображается как «[TAG] - 10%», без зелёных шариков."""
-    style = "danger" if tg["hit"] else None
+    """Кнопка тега: скидка — нативный зелёный стиль, хит — красный."""
     pct = db.disc_of(tg)
+    style = "success" if pct else ("danger" if tg["hit"] else None)
     label = tg["name"] + (f" - {pct}%" if pct else "")
     return btn(("🔒 " if tg["closed"] else "") + label, data, style=style)
 
