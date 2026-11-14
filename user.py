@@ -544,8 +544,8 @@ async def case_inventory_open(c: CallbackQuery, bot: Bot):
             c.from_user.id,
             animation=animation,
             caption=f"🎰 <b>Открываем кейс «{esc(result['case_name'])}»!</b>",
-            width=720,
-            height=1280,
+            width=1080,
+            height=1080,
         )
         animation_sent_at = time.monotonic()
     except Exception:
