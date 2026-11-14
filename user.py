@@ -536,18 +536,38 @@ async def case_inventory_open(c: CallbackQuery, bot: Bot):
     if result.get("error") == "empty_pool":
         return await c.answer("В кейсе сейчас нет доступных тегов. Напиши владельцу.", show_alert=True)
     await c.answer("🎰 Кейс открывается!")
+    animation_message = None
+    animation_sent_at = None
     try:
         animation = roulette._roulette_gif(result["case_name"], result["pool_names"], result["tag_name"])
-        await bot.send_animation(c.from_user.id, animation=animation,
-                                 caption=f"🎰 <b>Открываем кейс «{esc(result['case_name'])}»!</b>")
+        animation_message = await bot.send_animation(
+            c.from_user.id,
+            animation=animation,
+            caption=f"🎰 <b>Открываем кейс «{esc(result['case_name'])}»!</b>",
+            width=1280,
+            height=720,
+        )
+        animation_sent_at = time.monotonic()
     except Exception:
         logging.exception("Не удалось отправить GIF рулетки")
+    # Сначала ждём окончания прокрутки — сообщение с выигрышем не опережает GIF.
+    if animation_message is not None:
+        await asyncio.sleep(roulette._roulette_duration_seconds(result["pool_names"], result["tag_name"]) + 0.4)
     await bot.send_message(
         c.from_user.id,
         f"🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\nВ кейсе «{esc(result['case_name'])}» выпал тег:\n"
         f"🏆 <b>{esc(result['tag_name'])}</b>\n\nРезультат сохранён в «🎒 Мои кейсы».",
         reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")]])
     )
+    # Удаляем именно сообщение с GIF через 60 секунд после его отправки.
+    if animation_message is not None and animation_sent_at is not None:
+        remaining = 60.0 - (time.monotonic() - animation_sent_at)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        try:
+            await bot.delete_message(c.from_user.id, animation_message.message_id)
+        except Exception:
+            logging.exception("Не удалось удалить GIF рулетки message_id=%s", animation_message.message_id)
 
 
 @router.callback_query(F.data.regexp(r"^cases:issue:\d+$"))
