@@ -32,8 +32,8 @@ def _roulette_duration_seconds(tag_names: list[str], winner: str) -> float:
 
 
 def _roulette_gif(case_name: str, tag_names: list[str], winner: str) -> BufferedInputFile:
-    """Animated horizontal tag reel; the center stop is always the database winner."""
-    width, height = 960, 540
+    """Large portrait reel for Telegram mobile: tags move vertically through center."""
+    width, height = 720, 1280
     regular_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
@@ -43,14 +43,14 @@ def _roulette_gif(case_name: str, tag_names: list[str], winner: str) -> Buffered
         except OSError:
             return ImageFont.load_default()
 
-    title_font = font(30, True)
-    hint_font = font(21, True)
-    card_font = font(36, True)
-    small_font = font(18, True)
+    title_font = font(42, True)
+    hint_font = font(30, True)
+    card_font = font(58, True)
+    small_font = font(32, True)
     pool = _unique_pool(tag_names, winner)
 
-    # Позиция 24 — победитель в финальном кадре; все варианты пула
-    # гарантированно попадают в видимую ленту во время прокрутки.
+    # The winning tag is placed at the final center position. Every pool tag
+    # is included in the reel, while the final frame is tied to DB's winner.
     track = [random.choice(pool) for _ in range(25)]
     for i, tag in enumerate(pool[:20]):
         track[i] = tag
@@ -61,72 +61,66 @@ def _roulette_gif(case_name: str, tag_names: list[str], winner: str) -> Buffered
     track[24] = winner
 
     frames = []
-    card_w, card_h, gap = 224, 154, 18
-    step = card_w + gap
+    card_w, card_h, gap = 620, 190, 34
+    step = card_h + gap
     center_x = width // 2
-    center_y = 300
+    center_y = 640
     start_index = 14
     travel = 10.0
 
     for frame_index in range(FRAME_COUNT):
         t = frame_index / (FRAME_COUNT - 1)
-        # Ease-out curve: fast start, gradually slower finish.
         eased = 1 - (1 - t) ** 2.8
         offset = eased * travel
         final = frame_index == FRAME_COUNT - 1
 
-        im = Image.new("RGB", (width, height), (9, 14, 29))
+        im = Image.new("RGB", (width, height), (7, 12, 27))
         d = ImageDraw.Draw(im)
-        d.rounded_rectangle((14, 14, width - 14, height - 14), radius=30,
-                            fill=(13, 20, 39), outline=(48, 69, 105), width=3)
-        d.text((center_x, 72), "ОТКРЫТИЕ КЕЙСА", font=title_font,
-               fill=(245, 248, 255), anchor="mm")
-        d.text((center_x, 116), str(case_name)[:42], font=hint_font,
-               fill=(159, 183, 218), anchor="mm")
+        d.rounded_rectangle((12, 12, width - 12, height - 12), radius=34,
+                            fill=(13, 21, 42), outline=(55, 78, 119), width=4)
+        d.text((center_x, 100), "ОТКРЫТИЕ КЕЙСА", font=title_font,
+               fill=(248, 250, 255), anchor="mm")
+        d.text((center_x, 164), str(case_name)[:36], font=hint_font,
+               fill=(170, 194, 229), anchor="mm")
+        d.text((center_x, 240), "СЛЕДИ ЗА ВЫИГРЫШЕМ", font=hint_font,
+               fill=(255, 199, 92), anchor="mm")
 
-        # Reel background and side fades.
-        d.rounded_rectangle((28, 178, width - 28, 424), radius=24,
-                            fill=(7, 11, 23), outline=(44, 61, 91), width=2)
-
-        # Draw nearby cards on a continuous moving track.
+        # Tall reel window makes the animation occupy much more phone screen.
+        d.rounded_rectangle((34, 300, width - 34, 1000), radius=30,
+                            fill=(5, 9, 20), outline=(52, 72, 108), width=3)
         for idx, tag in enumerate(track):
-            x = center_x + (idx - start_index - offset) * step - card_w / 2
-            if x < -card_w or x > width:
+            y = center_y + (idx - start_index - offset) * step - card_h / 2
+            if y < 300 - card_h or y > 1000:
                 continue
-            y = center_y - card_h / 2
             is_center = abs((idx - start_index) - offset) < 0.52
-            fill = (34, 49, 77) if not is_center else (46, 67, 103)
-            outline = (65, 92, 137) if not is_center else (255, 190, 65)
-            d.rounded_rectangle((int(x), y, int(x + card_w), y + card_h),
-                                radius=22, fill=fill, outline=outline,
-                                width=5 if is_center else 2)
+            fill = (31, 47, 76) if not is_center else (53, 76, 116)
+            outline = (72, 101, 151) if not is_center else (255, 193, 67)
+            d.rounded_rectangle((50, int(y), width - 50, int(y + card_h)),
+                                radius=28, fill=fill, outline=outline,
+                                width=7 if is_center else 3)
             label = str(tag)
             f = card_font
-            while f.size > 19 and d.textbbox((0, 0), label, font=f)[2] > card_w - 28:
-                f = font(f.size - 2, True)
-            d.text((int(x + card_w / 2), center_y), label, font=f,
+            while f.size > 28 and d.textbbox((0, 0), label, font=f)[2] > card_w - 56:
+                f = font(f.size - 3, True)
+            d.text((center_x, int(y + card_h / 2)), label, font=f,
                    fill=(255, 255, 255), anchor="mm")
 
-        # Fixed center pointer and selection frame.
-        pointer_x = center_x
-        d.polygon([(pointer_x - 17, 165), (pointer_x + 17, 165), (pointer_x, 190)],
-                  fill=(255, 190, 65))
-        d.polygon([(pointer_x - 17, 437), (pointer_x + 17, 437), (pointer_x, 412)],
-                  fill=(255, 190, 65))
-        d.rounded_rectangle((center_x - 126, 194, center_x + 126, 406),
-                            radius=24, outline=(255, 190, 65), width=4)
-
-        footer = "ТЕГ ВЫПАЛ!" if final else "ПРОКРУТКА  •  ПРОКРУТКА  •  ПРОКРУТКА"
-        footer_color = (255, 205, 93) if final else (145, 171, 211)
-        d.text((center_x, 476), footer, font=hint_font,
-               fill=footer_color, anchor="mm")
+        # Fixed center markers show exactly which card is selected.
+        d.rounded_rectangle((45, center_y - card_h / 2 - 10,
+                             width - 45, center_y + card_h / 2 + 10),
+                            radius=30, outline=(255, 193, 67), width=7)
+        d.polygon([(center_x - 25, 286), (center_x + 25, 286), (center_x, 318)],
+                  fill=(255, 193, 67))
+        d.polygon([(center_x - 25, 1014), (center_x + 25, 1014), (center_x, 982)],
+                  fill=(255, 193, 67))
+        footer = "ТЕГ ВЫПАЛ!" if final else "РУЛЕТКА КРУТИТСЯ"
+        d.text((center_x, 1110), footer, font=title_font,
+               fill=(255, 207, 105) if final else (166, 190, 225), anchor="mm")
         if final:
-            # Ensure the winning tag is visibly centered in the final frame.
-            d.rounded_rectangle((center_x - 205, 492, center_x + 205, 526),
-                                radius=12, fill=(37, 54, 83))
-            d.text((center_x, 509), str(winner)[:48], font=small_font,
+            d.rounded_rectangle((42, 1160, width - 42, 1240), radius=22,
+                                fill=(35, 54, 86), outline=(255, 193, 67), width=3)
+            d.text((center_x, 1200), str(winner)[:40], font=small_font,
                    fill=(255, 255, 255), anchor="mm")
-
         frames.append(im.quantize(colors=128))
 
     output = io.BytesIO()
