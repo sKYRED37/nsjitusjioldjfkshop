@@ -178,7 +178,7 @@ def main_menu():
     row3 = ([btn(g("btn_reviews"), url=rv)] if rv else []) + [btn(g("btn_help"), "menu:help")]
     return kb([
         [btn(g("btn_catalog"), "menu:catalog")],
-        [btn("🔎 Умный поиск тегов", "search:open"), btn("🎁 Кейсы", "cases:list")],
+        [btn("🎁 Кейсы", "cases:list")],
         [btn(g("btn_coins"), "menu:coins"), btn(g("btn_bonus"), "menu:bonus")],
         [btn(g("btn_promo"), "menu:promo"), btn(g("btn_orders"), "menu:orders")],
         [btn(g("btn_fav"), "menu:fav")],
@@ -291,31 +291,115 @@ def catalog_search_menu():
     return kb([
         [btn("🔤 По названию", "search:mode:name")],
         [btn("💰 По цене", "search:mode:price")],
-        [btn("📅 По дням", "search:mode:days")],
+        [btn("📅 По сроку", "search:mode:days")],
         [btn("↩️ Вернуться в каталог", "menu:catalog")],
     ])
+
+
+def search_cancel_markup():
+    return kb([[btn("✖️ Отменить поиск", "search:cancel")],
+               [btn("↩️ Вернуться в каталог", "menu:catalog")]])
+
+
+def parse_search_days(raw):
+    """Минимальный срок поиска в днях; None означает поиск бессрочных предложений."""
+    value = (raw or "").strip().casefold().replace("ё", "е")
+    if value in ("бессрочно", "навсегда", "без срока", "безлимит", "∞", "бесконечно"):
+        return float("inf")
+    if not value:
+        raise ValueError
+    match = re.search(r"\d+", value)
+    if not match:
+        # Понятные словесные значения сроков.
+        if "недел" in value:
+            return 7
+        if "месяц" in value:
+            return 30
+        if "год" in value or "лет" in value:
+            return 365
+        if "дн" in value or "день" in value:
+            return 1
+        raise ValueError
+    amount = int(match.group())
+    if amount < 1:
+        raise ValueError
+    if "недел" in value:
+        amount *= 7
+    elif "месяц" in value:
+        amount *= 30
+    elif "год" in value or "лет" in value:
+        amount *= 365
+    # Верхнего ограничения нет: поддерживается любой положительный срок.
+    return amount
+
+
+def offer_duration_days(term):
+    """Преобразует срок предложения в дни. Бессрочные сроки обозначаются None."""
+    value = str(term or "").strip().casefold().replace("ё", "е")
+    if any(word in value for word in ("бессроч", "навсегда", "без срока", "безлимит", "∞")):
+        return float("inf")
+    match = re.search(r"\d+", value)
+    if match:
+        amount = int(match.group())
+        if "недел" in value:
+            return amount * 7
+        if "месяц" in value:
+            return amount * 30
+        if "год" in value or "лет" in value:
+            return amount * 365
+        if "дн" in value or "день" in value or not re.search(r"[а-яa-z]", value):
+            return amount
+    if "недел" in value:
+        return 7
+    if "месяц" in value:
+        return 30
+    if "год" in value or "лет" in value:
+        return 365
+    if "дн" in value or "день" in value:
+        return 1
+    return None
 
 
 @router.callback_query(F.data == "search:open")
 async def search_open(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await state.set_state(TagSearch.mode)
-    await show(c, "🔎 <b>Поиск тега</b>\\nВыбери способ поиска:", catalog_search_menu())
+    await show(c, "🔎 <b>Поиск тега</b>\nВыбери способ поиска:", catalog_search_menu())
 
 
 @router.callback_query(F.data.regexp(r"^search:mode:(name|price|days)$"))
 async def search_mode(c: CallbackQuery, state: FSMContext):
     mode = c.data.rsplit(":", 1)[1]
-    prompts = {
-        "name": "🔤 Введи название тега или его часть:",
-        "price": "💰 Введи максимальную цену в рублях (целое положительное число):",
-        "days": "📅 Введи срок: например 30, 90, 180 или «месяц»:",
-    }
     await state.clear()
     await state.update_data(search_mode=mode)
+    if mode == "price":
+        await state.set_state(TagSearch.mode)
+        await show(c, "💰 <b>Поиск по цене</b>\nВыбери валюту максимальной цены:", kb([
+            [btn("₽ Рубли", "search:currency:rub")],
+            [btn("⭐ Звёзды", "search:currency:stars")],
+            [btn("🪙 Голда", "search:currency:gold")],
+            [btn("✖️ Отменить поиск", "search:cancel")],
+            [btn("↩️ Вернуться в каталог", "menu:catalog")],
+        ]))
+        return
+    prompt = ("🔤 Введи название тега или его часть:" if mode == "name" else
+              "📅 Введи минимальный срок от 1 дня до любого количества дней (например: 1, 30, 90, 365, 10000) или «бессрочно»:")
     await state.set_state(TagSearch.query)
-    await show(c, prompts[mode], kb([[btn("✖️ Отменить поиск", "search:cancel")],
-                                     [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
+    await show(c, prompt, search_cancel_markup())
+
+
+@router.callback_query(F.data.regexp(r"^search:currency:(rub|stars|gold)$"))
+async def search_currency(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if data.get("search_mode") != "price":
+        await state.clear()
+        return await show(c, "Сессия поиска устарела. Начни поиск заново.", kb([
+            [btn("🔎 Искать ещё", "search:open")], [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
+    currency = c.data.rsplit(":", 1)[1]
+    await state.update_data(search_currency=currency)
+    await state.set_state(TagSearch.query)
+    labels = {"rub": "рублях ₽", "stars": "звёздах ⭐", "gold": "голде 🪙"}
+    await show(c, f"💰 Введи максимальную цену в {labels[currency]} (целое число от 1):", search_cancel_markup())
 
 
 @router.callback_query(F.data == "search:cancel")
@@ -331,72 +415,67 @@ async def search_run(m: Message, state: FSMContext):
     mode = data.get("search_mode")
     raw = (m.text or "").strip()
     if not raw:
-        return await m.answer("Введи непустое значение или отмени поиск.")
+        return await m.answer("Введи значение или отмени поиск.", reply_markup=search_cancel_markup())
     try:
+        # Берём только видимые теги с доступными предложениями. Закрытые сроки
+        # не участвуют в поиске и не могут привести к карточке без актуальной цены.
         sql = """SELECT t.* FROM tags t
                  WHERE COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
                    AND (t.slots IS NULL OR t.slots>0)
-                   AND EXISTS (SELECT 1 FROM prices available
-                               WHERE available.tag_id=t.id AND COALESCE(available.closed,0)=0
-                                 AND (COALESCE(available.price_rub,0)>0
-                                   OR COALESCE(available.price_gold,0)>0
-                                   OR COALESCE(available.price_stars,0)>0
-                                   OR COALESCE(available.price_boosts,0)>0
-                                   OR COALESCE(available.coins,0)>0))"""
-        args = []
-        name_filter = None
+                   AND EXISTS (SELECT 1 FROM prices p WHERE p.tag_id=t.id
+                               AND COALESCE(p.closed,0)=0
+                               AND (COALESCE(p.price_rub,0)>0 OR COALESCE(p.price_gold,0)>0
+                                    OR COALESCE(p.price_stars,0)>0))
+                 ORDER BY t.id DESC"""
+        tags = db.q(sql)
+        matches = []
         if mode == "name":
-            # SQLite lower() без ICU не приводит кириллицу к нижнему регистру.
-            # Сравниваем через Unicode casefold в Python.
-            name_filter = raw.casefold()
+            needle = raw.casefold()
+            matches = [tg for tg in tags if needle in str(tg["name"]).casefold()]
         elif mode == "price":
-            price = int(raw.replace(" ", "").replace(",", ""))
-            if price <= 0 or price > 10**9:
-                raise ValueError()
-            sql += """ AND EXISTS (SELECT 1 FROM prices p WHERE p.tag_id=t.id
-                       AND COALESCE(p.closed,0)=0 AND p.price_rub>0
-                       AND CAST(p.price_rub * (100 - CASE
-                           WHEN COALESCE(t.disc_pct,0)>0
-                            AND (t.disc_until IS NULL OR t.disc_until>?) THEN t.disc_pct
-                           ELSE 0 END) / 100 AS INTEGER) <= ?)"""
-            args.extend((int(time.time()), price))
+            currency = data.get("search_currency")
+            col = {"rub": "price_rub", "stars": "price_stars", "gold": "price_gold"}.get(currency)
+            if not col:
+                raise ValueError
+            maximum = int(raw.replace(" ", "").replace(",", ""))
+            if maximum < 1:
+                raise ValueError
+            promo = db.active_promo(m.from_user.id)
+            for tg in tags:
+                pct = db.total_pct(promo, tg["id"])
+                offers = db.q(f"SELECT {col} amount FROM prices WHERE tag_id=? AND COALESCE(closed,0)=0 AND COALESCE({col},0)>0", (tg["id"],))
+                if any(db.apply_discount(o["amount"], pct) <= maximum for o in offers):
+                    matches.append(tg)
         elif mode == "days":
-            q = raw.casefold().strip()
-            if q in ("месяц", "месяца", "месяцев"):
-                days = 30
-            else:
-                match = re.search(r"\\d+", q)
-                if not match:
-                    raise ValueError()
-                days = int(match.group())
-                if "месяц" in q:
-                    days *= 30
-            if days <= 0 or days > 36500:
-                raise ValueError()
-            sql += """ AND EXISTS (SELECT 1 FROM prices p WHERE p.tag_id=t.id
-                       AND COALESCE(p.closed,0)=0
-                       AND (CAST(p.term AS TEXT) LIKE ?
-                            OR (lower(p.term) LIKE '%месяц%' AND ? BETWEEN 28 AND 31)
-                            OR (lower(p.term) LIKE '%месяц%'
-                                AND CAST(p.term AS INTEGER)*30=?)))"""
-            args.extend((f"%{days}%", days, days))
+            wanted = parse_search_days(raw)
+            for tg in tags:
+                offers = db.q("""SELECT term FROM prices WHERE tag_id=? AND COALESCE(closed,0)=0
+                                AND (COALESCE(price_rub,0)>0 OR COALESCE(price_gold,0)>0 OR COALESCE(price_stars,0)>0)""", (tg["id"],))
+                durations = [offer_duration_days(o["term"]) for o in offers]
+                if wanted == float("inf"):
+                    suitable = any(d == float("inf") for d in durations)
+                else:
+                    suitable = any(d == float("inf") or (d is not None and d >= wanted) for d in durations)
+                if suitable:
+                    matches.append(tg)
         else:
             await state.clear()
-            return await m.answer("Сессия поиска устарела. Начни поиск заново.",
-                                  reply_markup=kb([[btn("🔎 Искать ещё", "search:open")],
-                                                   [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
-        sql += " ORDER BY t.id DESC" + ("" if mode == "name" else " LIMIT 50")
-        rows = db.q(sql, tuple(args))
-        if name_filter is not None:
-            rows = [row for row in rows if name_filter in row["name"].casefold()][:50]
+            return await m.answer("Сессия поиска устарела. Начни поиск заново.", reply_markup=kb([
+                [btn("🔎 Искать ещё", "search:open")], [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
+        matches = matches[:50]
     except (ValueError, TypeError):
-        return await m.answer("Некорректный ввод. Для цены и срока используй положительное число, либо «месяц». Попробуй ещё раз.",
-                              reply_markup=kb([[btn("✖️ Отменить поиск", "search:cancel")]]))
+        if mode == "price":
+            hint = "Введи целое положительное число цены."
+        elif mode == "days":
+            hint = "Введи срок от 1 дня (например, 30 или 90) либо «бессрочно»."
+        else:
+            hint = "Введи название или часть названия тега."
+        return await m.answer("Некорректный ввод. " + hint, reply_markup=search_cancel_markup())
     await state.clear()
-    buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in rows]
+    buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in matches]
     buttons += [[btn("🔎 Искать ещё", "search:open")],
                 [btn("↩️ Вернуться в каталог", "menu:catalog")]]
-    await m.answer((f"🔎 Найдено тегов: {len(rows)}" if rows else
+    await m.answer((f"🔎 Найдено тегов: {len(matches)}" if matches else
                     "По этому запросу нет доступных тегов или предложений."),
                    reply_markup=kb(buttons))
 
