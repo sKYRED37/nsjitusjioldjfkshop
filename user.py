@@ -3,6 +3,7 @@ import hashlib
 import logging
 import html
 import re
+import random
 import time
 
 from aiogram import Router, F, Bot, BaseMiddleware
@@ -14,7 +15,6 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 import banner
 import db
-import roulette
 import favorites
 import links
 from texts import t
@@ -536,38 +536,51 @@ async def case_inventory_open(c: CallbackQuery, bot: Bot):
     if result.get("error") == "empty_pool":
         return await c.answer("В кейсе сейчас нет доступных тегов. Напиши владельцу.", show_alert=True)
     await c.answer("🎰 Кейс открывается!")
-    animation_message = None
-    animation_sent_at = None
-    try:
-        animation = roulette._roulette_gif(result["case_name"], result["pool_names"], result["tag_name"])
-        animation_message = await bot.send_animation(
-            c.from_user.id,
-            animation=animation,
-            caption=f"🎰 <b>Открываем кейс «{esc(result['case_name'])}»!</b>",
-            width=1080,
-            height=1080,
+    # Текстовая рулетка: одно крупное сообщение обновляется по ходу прокрутки.
+    pool = list(dict.fromkeys(str(x).strip() for x in result["pool_names"] if str(x).strip()))
+    winner = str(result["tag_name"])
+    if winner not in pool:
+        pool.append(winner)
+    if not pool:
+        pool = [winner]
+
+    def reel_frame(tag: str, step: int, total: int, final: bool = False) -> str:
+        marker = "🟨" if final else "🔻"
+        state = "🏆 <b>ВЫПАЛО!</b>" if final else f"🎰 <b>РУЛЕТКА КРУТИТСЯ</b>  <code>{step}/{total}</code>"
+        return (
+            f"🎁 <b>ОТКРЫТИЕ КЕЙСА</b>\n"
+            f"<b>{esc(result['case_name'])}</b>\n\n"
+            f"{state}\n\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"       {marker}\n"
+            f"   <b>{esc(tag)}</b>\n"
+            f"       {marker}\n"
+            f"━━━━━━━━━━━━━━━━━━\n\n"
+            f"{'✨ ТВОЙ РЕЗУЛЬТАТ ✨' if final else 'Определяем выпавший тег…'}"
         )
-        animation_sent_at = time.monotonic()
-    except Exception:
-        logging.exception("Не удалось отправить GIF рулетки")
-    # Сначала ждём окончания прокрутки — сообщение с выигрышем не опережает GIF.
-    if animation_message is not None:
-        await asyncio.sleep(roulette._roulette_duration_seconds(result["pool_names"], result["tag_name"]) + 0.4)
+
+    # Сначала показываем стартовое сообщение, затем обновляем его с ускорением/замедлением.
+    reel_message = await bot.send_message(
+        c.from_user.id,
+        reel_frame(random.choice(pool), 0, 18),
+    )
+    sequence = [random.choice(pool) for _ in range(17)] + [winner]
+    for index, tag in enumerate(sequence, start=1):
+        # Последние шаги становятся медленнее, создавая эффект остановки.
+        delay = 0.16 + 0.34 * ((index / len(sequence)) ** 2.4)
+        await asyncio.sleep(delay)
+        try:
+            await reel_message.edit_text(reel_frame(tag, index, len(sequence), final=(index == len(sequence))))
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logging.warning("Не удалось обновить кадр текстовой рулетки: %s", exc)
+
     await bot.send_message(
         c.from_user.id,
         f"🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\nВ кейсе «{esc(result['case_name'])}» выпал тег:\n"
-        f"🏆 <b>{esc(result['tag_name'])}</b>\n\nРезультат сохранён в «🎒 Мои кейсы».",
+        f"🏆 <b>{esc(winner)}</b>\n\nРезультат сохранён в «🎒 Мои кейсы»." ,
         reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")]])
     )
-    # Удаляем именно сообщение с GIF через 60 секунд после его отправки.
-    if animation_message is not None and animation_sent_at is not None:
-        remaining = 60.0 - (time.monotonic() - animation_sent_at)
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        try:
-            await bot.delete_message(c.from_user.id, animation_message.message_id)
-        except Exception:
-            logging.exception("Не удалось удалить GIF рулетки message_id=%s", animation_message.message_id)
 
 
 @router.callback_query(F.data.regexp(r"^cases:issue:\d+$"))
