@@ -85,20 +85,17 @@ def btn(text, data=None, url=None, style=None):
 
 
 def tag_label(tg):
-    """Подпись тега: хит отмечается огоньком, скидка — зелёным маркером и полным текстом."""
+    """Подпись тега: скидка показывается компактно, без цветных маркеров."""
     pct = db.disc_of(tg)
-    name = tg["name"] + (f" - Скидка {pct}%" if pct else "")
-    return ("🔥 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
+    name = tg["name"] + (f" - {pct}%" if pct else "")
+    return ("🔥 " if tg["hit"] else "") + name
 
 
 def tag_btn(tg, data):
-    """Кнопка тега: хит — красный стиль, скидка — зелёный стиль; закрытый — с замком."""
-    # Если одновременно хит и скидка, приоритет красного стиля у хита,
-    # а скидка дополнительно отмечается зелёным маркером в подписи.
-    style = "danger" if tg["hit"] else ("success" if db.disc_of(tg) else None)
+    """Кнопка тега: скидка отображается как «[TAG] - 10%», без зелёных шариков."""
+    style = "danger" if tg["hit"] else None
     pct = db.disc_of(tg)
-    # Красный маркер кнопки уже обозначает хит; не дублируем его вторым огоньком.
-    label = (("🟢 " if pct else "") + tg["name"] + (f" - Скидка {pct}%" if pct else ""))
+    label = tg["name"] + (f" - {pct}%" if pct else "")
     return btn(("🔒 " if tg["closed"] else "") + label, data, style=style)
 
 

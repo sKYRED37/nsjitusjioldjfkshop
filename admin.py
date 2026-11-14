@@ -262,7 +262,8 @@ async def admin_case_issue_decide(c: CallbackQuery, bot: Bot):
     await c.answer("Решение сохранено")
 
 
-# ---------------- проверка оплаты кейсов --@router.callback_query(F.data.regexp(r"^adm:case(ok|no):\d+$"))
+# ---------------- проверка оплаты кейсов ----------------
+@router.callback_query(F.data.regexp(r"^adm:case(ok|no):\d+$"))
 async def admin_case_order_decide(c: CallbackQuery, bot: Bot):
     _, action, oid = c.data.split(":")
     order_id = int(oid)
