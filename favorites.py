@@ -43,8 +43,9 @@ def build(tag, kind, ex):
         return t("txt_fav_n_discount", name=name, pct=pct, price=price, left=left).strip()
     if kind == "ending":
         return t("txt_fav_n_ending", name=name, left=_left(ex["left"]), price=price)
-    if kind == "raised":
-        return t("txt_fav_n_raised", name=name, old=_fmt(ex["old"]), new=_fmt(ex["new"]))
+    if kind in ("raised", "lowered"):
+        direction = "подорожал" if kind == "raised" else "подешевел"
+        return f"{'📈' if kind == 'raised' else '📉'} <b>Тег {name} {direction}</b>\nБыло от {_fmt(ex['old'])} ₽ — стало от {_fmt(ex['new'])} ₽."
     return t("txt_fav_n_ended", name=name, new=_fmt(ex["new"]) if ex["new"] else "—")
 
 
@@ -59,8 +60,9 @@ async def check(bot: Bot):
     for uid, tag, kind, ex in db.fav_events():
         try:
             await bot.send_message(uid, build(tag, kind, ex), reply_markup=markup(tag["id"]))
+            db.fav_mark_notified(uid, tag["id"], ex["_state"])
         except Exception:
-            pass  # пользователь заблокировал бота и т.п.
+            logging.exception("Не удалось отправить уведомление избранного uid=%s tag_id=%s", uid, tag["id"])
         await asyncio.sleep(0.05)  # не упираемся в лимиты Telegram
 
 
@@ -74,7 +76,19 @@ async def _loop(bot: Bot):
 
 
 def ensure_watcher(bot: Bot):
-    """Запускает фоновую проверку один раз (вызывается при первом обновлении от пользователя)."""
+    """Запускает фоновую проверку один раз, в том числе сразу при старте бота."""
     global _task
     if _task is None or _task.done():
-        _task = asyncio.create_task(_loop(bot))
+        _task = asyncio.create_task(_loop(bot), name="favorites-price-watcher")
+
+
+async def stop_watcher():
+    """Останавливает watcher перед закрытием Bot/перезапуском ядра."""
+    global _task
+    task, _task = _task, None
+    if task is not None and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass

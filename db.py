@@ -546,16 +546,27 @@ def fav_events():
             kind, warned = "discount", 0
         elif cur_disc and left is not None and left <= FAV_WARN_HOURS * 3600 and not warned:
             kind, warned = "ending", 1
-        elif base is not None and last_price is not None and base > last_price:
-            kind = "raised"
+        elif base is not None and last_price is not None and base != last_price:
+            kind = "raised" if base > last_price else "lowered"
         elif last_disc and not cur_disc:
             kind, warned = "ended", 0
         if cur_disc and left is not None and left > FAV_WARN_HOURS * 3600:
             warned = 0
         if (cur_disc, base, warned) != (last_disc, last_price, r["end_warned"] or 0):
-            _conn.execute("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
-                          (cur_disc, base, warned, r["user_id"], r["id"]))
+            # Не подтверждаем событие до успешной отправки уведомления:
+            # иначе временная ошибка Telegram теряет уведомление навсегда.
+            if not kind:
+                _conn.execute("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
+                              (cur_disc, base, warned, r["user_id"], r["id"]))
         if kind:
-            out.append((r["user_id"], r, kind, {"old": last_price, "new": base, "left": left, "pct": cur_disc}))
+            out.append((r["user_id"], r, kind, {"old": last_price, "new": base, "left": left,
+                                                 "pct": cur_disc, "_state": (cur_disc, base, warned)}))
     _conn.commit()
     return out
+
+
+def fav_mark_notified(uid, tag_id, state):
+    """Фиксирует состояние только после успешной доставки уведомления."""
+    cur_disc, base, warned = state
+    ex("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
+       (cur_disc, base, warned, uid, tag_id))

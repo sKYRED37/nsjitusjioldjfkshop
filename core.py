@@ -17,6 +17,7 @@ import db  # noqa: E402
 import links  # noqa: E402
 import admin  # noqa: E402
 import user  # noqa: E402
+import favorites  # noqa: E402
 
 
 def to_ids(value):
@@ -83,6 +84,7 @@ async def main(cfg):
     dp.include_router(admin.router)  # админ-роутер первым: он пропускает только админов
     dp.include_router(user.router)
     try:
+        favorites.ensure_watcher(bot)  # Проверяем избранное сразу после запуска, даже до первого сообщения пользователя.
         try:
             await bot.delete_webhook(drop_pending_updates=False)  # если раньше стоял вебхук — polling иначе не заработает
         except TelegramUnauthorizedError:
@@ -98,6 +100,7 @@ async def main(cfg):
         print(f"Бот @{me.username} запущен. Админ-панель: /admin")
         await dp.start_polling(bot)
     finally:
+        await favorites.stop_watcher()
         await bot.session.close()  # иначе при перезапуске копятся незакрытые сессии
 
 

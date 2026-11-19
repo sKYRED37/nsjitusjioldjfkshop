@@ -1099,24 +1099,47 @@ async def cb_bc(c: CallbackQuery, state: FSMContext):
     await show(c, "📢 Отправь текст рассылки (получат все пользователи бота):", kb([back()]))
 
 
-@router.message(A.broadcast, F.text, ~F.text.startswith("/"))
+@router.message(A.broadcast)
 async def got_bc(m: Message, state: FSMContext, bot: Bot):
+    """Рассылает любое сообщение администратора: текст, фото с подписью,
+    пересланный пост, видео, документ и другие типы, поддерживаемые copyMessage.
+    Копирование сохраняет подпись и форматирование, но не добавляет автора
+    пересылки от имени админа.
+    """
+    # Не завершаем рассылку пустым/служебным сообщением.
+    if not m.content_type or m.content_type == "unknown":
+        return await m.answer("Не удалось распознать сообщение. Отправь текст, фото с подписью или перешли пост ещё раз.")
+
     await state.clear()
+    status = await m.answer("📢 Рассылка запущена…")
     ok = bad = 0
-    await m.answer("📢 Рассылка запущена…")
-    for u in db.q("SELECT user_id FROM users WHERE COALESCE(banned,0)=0"):
+    users = db.q("SELECT user_id FROM users WHERE COALESCE(banned,0)=0")
+    for u in users:
+        uid = u["user_id"]
         for attempt in range(3):
             try:
-                await bot.send_message(u["user_id"], m.html_text)
+                await bot.copy_message(
+                    chat_id=uid,
+                    from_chat_id=m.chat.id,
+                    message_id=m.message_id,
+                )
                 ok += 1
                 break
             except TelegramRetryAfter as e:
-                await asyncio.sleep(e.retry_after + 1)
+                if attempt == 2:
+                    bad += 1
+                else:
+                    await asyncio.sleep(e.retry_after + 1)
             except Exception:
                 bad += 1
                 break
-        await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/сек
-    await m.answer(f"📢 Рассылка завершена. Доставлено: {ok}, ошибок: {bad}.", reply_markup=kb([back()]))
+        # Не превышаем общий лимит отправки сообщений Telegram.
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(
+        f"📢 Рассылка завершена. Доставлено: {ok}, ошибок: {bad}.",
+        reply_markup=kb([back()]),
+    )
 
 
 # ---------------- места ----------------
