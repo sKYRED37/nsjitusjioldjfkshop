@@ -327,55 +327,39 @@ def _plate_box(i):
 
 
 def render_tags(names, **_ignored):
-    """Баннер «Выбери тэг»: названия тегов страницы вписываются в плашки по порядку,
-    лишние плашки (с [TAG] и номером) стираются. До 8 тегов → байты JPEG."""
-    global _tags_tpl
-    if _tags_tpl is None:
-        _tags_tpl = Image.open(find_file(TAGS_TEMPLATE)).convert("RGB")
-    base = _tags_tpl.copy()
+    """Строит уникальный баннер текущей страницы поверх нового красного фона."""
+    base = Image.open(find_file("tags_background.jpg")).convert("RGB")
     W, H = base.size
-    names = [str(n).strip() for n in names if str(n).strip()][:TAGS_PER_PAGE]
-    cl = ImageDraw.Draw(base)
-    px = base.load()
-    erase = []
-    for i in range(TAGS_PER_PAGE):
-        x0, y0, x1, y1 = _plate_box(i)
-        if i >= len(names):
-            # плашки нет — стираем целиком (с запасом на свечение), фон плавно подмешивается
-            erase.append((x0 - 8, y0 - 6, x1 + 10, y1 + 8))
-        else:
-            cy = (y0 + y1) // 2
-            cl.rectangle((x0 + TAGS_TEXT_DX[0] - 296 + 0, cy - 44, x0 + TAGS_TEXT_DX[1] - 296, cy + 44),
-                         fill=px[x0 + 440 - 296 + 30, cy])
-    if erase:
-        # стираем пустые плашки с мягкими краями, чтобы не было видно прямоугольника
-        mask = Image.new("L", (W, H), 0)
-        md = ImageDraw.Draw(mask)
-        for box in erase:
-            md.rectangle(box, fill=255)
-        mask = mask.filter(ImageFilter.GaussianBlur(7))
-        base.paste(Image.new("RGB", (W, H), TAGS_BG), (0, 0), mask)
-    layer = Image.new("RGBA", (W * S, H * S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    for i, raw in enumerate(names):
-        x0, y0, x1, y1 = _plate_box(i)
-        cy = (y0 + y1) / 2 + 2
-        name = raw
-        if name.startswith("[") and name.endswith("]"):
-            name = name[1:-1]
-        name = name.upper()
-        zone0, zone1 = x0 + TAGS_TEXT_DX[0] - 296, x0 + TAGS_TEXT_DX[1] - 296
-        cx = (zone0 + zone1) / 2
-        maxw = zone1 - zone0 - 90  # место под красные скобки
-        f = fit(name, 850, 56, maxw, 22)
-        tw = f.getlength(name) / S
-        d.text((cx * S, cy * S), name, font=f, fill=WHITE, anchor="mm")
-        # красные скобки [ ] по краям названия
-        bf = font(int(f.size / S * 1.05) or 30, 850)
-        d.text(((cx - tw / 2 - 12) * S, cy * S), "[", font=bf, fill=RED, anchor="rm")
-        d.text(((cx + tw / 2 + 12) * S, cy * S), "]", font=bf, fill=RED, anchor="lm")
-    layer = layer.resize((W, H), Image.LANCZOS)
-    base.paste(layer, (0, 0), layer)
+    names = [str(n).strip() for n in names if str(n).strip()][:8]
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    if names:
+        cols = 2
+        rows = (len(names) + cols - 1) // cols
+        margin_x, gap_x, gap_y = int(W * 0.12), 34, 22
+        box_w = (W - 2 * margin_x - gap_x) // cols
+        box_h = min(112, int((H * 0.68 - (rows - 1) * gap_y) / rows))
+        total_h = rows * box_h + (rows - 1) * gap_y
+        top = (H - total_h) // 2
+        for i, raw in enumerate(names):
+            col, row = i % cols, i // cols
+            x0, y0 = margin_x + col * (box_w + gap_x), top + row * (box_h + gap_y)
+            x1, y1 = x0 + box_w, y0 + box_h
+            od.rounded_rectangle((x0, y0, x1, y1), radius=18, fill=(12, 0, 0, 178), outline=(255, 25, 35, 235), width=3)
+            label = raw[1:-1] if raw.startswith("[") and raw.endswith("]") else raw
+            label = label.upper()
+            fs, ff = 46, None
+            while fs > 20:
+                try:
+                    ff = ImageFont.truetype(find_file(FONT_NAME), fs)
+                except Exception:
+                    ff = ImageFont.load_default()
+                    break
+                if od.textbbox((0, 0), label, font=ff)[2] <= box_w - 42:
+                    break
+                fs -= 2
+            od.text(((x0 + x1) // 2, (y0 + y1) // 2), label, font=ff, fill=(255, 255, 255, 255), anchor="mm", stroke_width=1, stroke_fill=(80, 0, 0, 255))
+    base = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
     out = io.BytesIO()
-    base.save(out, "JPEG", quality=92)
+    base.save(out, "JPEG", quality=92, optimize=True)
     return out.getvalue()

@@ -70,23 +70,25 @@ def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# Используем настоящую окраску кнопок, если установленная версия aiogram
-# и Telegram поддерживают поле style. В запасном режиме не добавляем цветные кружки.
-USE_NATIVE_STYLE = True
+# Цвет кнопок: по умолчанию эмодзи 🟢 (скидка) и 🔴 (хит в админке) — работает везде.
+USE_NATIVE_STYLE = False  # True — красить кнопки средствами Telegram (если у тебя новый aiogram и Telegram их принимает)
 STYLE_OK = USE_NATIVE_STYLE and "style" in getattr(InlineKeyboardButton, "model_fields", {})
+_FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
 
 
 def btn(text, data=None, url=None, style=None):
     if style and STYLE_OK:
         return InlineKeyboardButton(text=text, callback_data=data, url=url, style=style)
+    if style:
+        text = _FALLBACK_EMOJI.get(style, "") + text
     return InlineKeyboardButton(text=text, callback_data=data, url=url)
 
 
 def tag_label(tg):
-    """Подпись тега: хит отмечается огоньком, скидка — текстом без цветных кружков."""
+    """Подпись тега: хит отмечается огоньком, скидка — зелёным маркером и полным текстом."""
     pct = db.disc_of(tg)
-    name = tg["name"] + (f" — Скидка {pct}%" if pct else "")
-    return ("🔥 " if tg["hit"] else "") + name
+    name = tg["name"] + (f" - Скидка {pct}%" if pct else "")
+    return ("🔥 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
 
 
 def tag_btn(tg, data):
@@ -490,11 +492,10 @@ async def cb_cat(c: CallbackQuery):
     text = t("txt_cat_page", name=esc(cat["name"]), page=page + 1, pages=pages)
     if not tags:
         text = t("txt_cat_empty", name=esc(cat["name"]))
-    manual = db.page_banner(cid, page)  # баннер, загруженный админом вручную, главнее автоматического
-    gen = None
-    # Фоновое изображение каталога используется вместо автоматически собранного
-    # баннера с плашками. Ручной баннер конкретной страницы остаётся приоритетным.
-    await show(c, text, kb(rows), "tags", fid=manual or (None if gen else cat["banner"]), gen=gen)
+    # Для каждой страницы строится собственный баннер из тегов текущего блока.
+    # При перелистывании меняется список названий и, соответственно, изображение.
+    gen = await make_tags_banner([tg["name"] for tg in chunk])
+    await show(c, text, kb(rows), "tags", gen=gen)
 
 
 async def make_tags_banner(names):
