@@ -70,25 +70,23 @@ def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# Цвет кнопок: по умолчанию эмодзи 🟢 (скидка) и 🔴 (хит в админке) — работает везде.
-USE_NATIVE_STYLE = False  # True — красить кнопки средствами Telegram (если у тебя новый aiogram и Telegram их принимает)
+# Используем настоящую окраску кнопок, если установленная версия aiogram
+# и Telegram поддерживают поле style. В запасном режиме не добавляем цветные кружки.
+USE_NATIVE_STYLE = True
 STYLE_OK = USE_NATIVE_STYLE and "style" in getattr(InlineKeyboardButton, "model_fields", {})
-_FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
 
 
 def btn(text, data=None, url=None, style=None):
     if style and STYLE_OK:
         return InlineKeyboardButton(text=text, callback_data=data, url=url, style=style)
-    if style:
-        text = _FALLBACK_EMOJI.get(style, "") + text
     return InlineKeyboardButton(text=text, callback_data=data, url=url)
 
 
 def tag_label(tg):
-    """Подпись тега: хит отмечается огоньком, скидка — зелёным маркером и полным текстом."""
+    """Подпись тега: хит отмечается огоньком, скидка — текстом без цветных кружков."""
     pct = db.disc_of(tg)
-    name = tg["name"] + (f" - Скидка {pct}%" if pct else "")
-    return ("🔥 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
+    name = tg["name"] + (f" — Скидка {pct}%" if pct else "")
+    return ("🔥 " if tg["hit"] else "") + name
 
 
 def tag_btn(tg, data):
