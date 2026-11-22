@@ -46,106 +46,6 @@ def ex(sql, args=()):
     return cur.lastrowid
 
 
-
-
-def claim_case_order(order_id: int):
-    """Подтверждает оплату и помещает неоткрытый кейс в инвентарь покупателя."""
-    _conn.execute("BEGIN IMMEDIATE")
-    try:
-        order = _conn.execute(
-            "SELECT * FROM case_orders WHERE id=? AND status='pending'", (int(order_id),)
-        ).fetchone()
-        if not order:
-            _conn.commit()
-            return None
-        pool = _conn.execute(
-            """SELECT 1 FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
-               WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0
-                 AND COALESCE(t.closed,0)=0
-                 AND (t.slots IS NULL OR t.slots>0) LIMIT 1""",
-            (order["case_id"],)
-        ).fetchone()
-        if not pool:
-            _conn.commit()
-            return {"error": "empty_pool"}
-        cur = _conn.execute(
-            "UPDATE case_orders SET status='paid' WHERE id=? AND status='pending'",
-            (int(order_id),)
-        )
-        if cur.rowcount != 1:
-            _conn.rollback()
-            return None
-        cur = _conn.execute(
-            "INSERT INTO case_inventory(user_id,case_id,price,created_at) VALUES(?,?,?,?)",
-            (order["user_id"], order["case_id"], order["amount"], int(time.time()))
-        )
-        inventory_id = cur.lastrowid
-        _conn.commit()
-        return {"order": order, "inventory_id": inventory_id}
-    except Exception:
-        _conn.rollback()
-        raise
-
-
-def open_case_inventory(inventory_id: int, user_id: int):
-    """Атомарно открывает купленный кейс и фиксирует единственный результат."""
-    _conn.execute("BEGIN IMMEDIATE")
-    try:
-        item = _conn.execute(
-            "SELECT * FROM case_inventory WHERE id=? AND user_id=? AND opened_at IS NULL",
-            (int(inventory_id), int(user_id))
-        ).fetchone()
-        if not item:
-            _conn.commit()
-            return None
-        pool = _conn.execute(
-            """SELECT t.id, t.name FROM case_tags ct JOIN tags t ON t.id=ct.tag_id
-               WHERE ct.case_id=? AND COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
-                 AND (t.slots IS NULL OR t.slots>0) ORDER BY t.id""",
-            (item["case_id"],)
-        ).fetchall()
-        if not pool:
-            _conn.commit()
-            return {"error": "empty_pool"}
-        chosen = random.choice(pool)
-        now = int(time.time())
-        cur = _conn.execute(
-            "INSERT INTO case_draws(user_id,case_id,tag_id,price,created_at) VALUES(?,?,?,?,?)",
-            (int(user_id), item["case_id"], int(chosen["id"]), item["price"], now)
-        )
-        draw_id = cur.lastrowid
-        cur = _conn.execute(
-            "UPDATE case_inventory SET opened_at=?,draw_id=? WHERE id=? AND user_id=? AND opened_at IS NULL",
-            (now, draw_id, int(inventory_id), int(user_id))
-        )
-        if cur.rowcount != 1:
-            _conn.rollback()
-            return None
-        case = _conn.execute("SELECT name FROM cases WHERE id=?", (item["case_id"],)).fetchone()
-        _conn.commit()
-        return {"inventory": item, "tag_id": int(chosen["id"]), "tag_name": chosen["name"],
-                "case_name": case["name"] if case else "Кейс", "draw_id": draw_id,
-                "pool_names": [x["name"] for x in pool]}
-    except Exception:
-        _conn.rollback()
-        raise
-
-
-def reject_case_order(order_id: int) -> bool:
-    """Атомарно отклоняет только ещё ожидающий заказ."""
-    _conn.execute("BEGIN IMMEDIATE")
-    try:
-        cur = _conn.execute(
-            "UPDATE case_orders SET status='rejected' WHERE id=? AND status='pending'",
-            (int(order_id),)
-        )
-        _conn.commit()
-        return cur.rowcount == 1
-    except Exception:
-        _conn.rollback()
-        raise
-
-
 def init(owner_id: int):
     _conn.executescript(
         """
@@ -194,11 +94,6 @@ def init(owner_id: int):
         CREATE TABLE IF NOT EXISTS case_draws(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, case_id INTEGER NOT NULL,
             tag_id INTEGER NOT NULL, price INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS case_inventory(
-            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, case_id INTEGER NOT NULL,
-            price INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
-            opened_at INTEGER, draw_id INTEGER);
-        CREATE INDEX IF NOT EXISTS idx_case_inventory_user ON case_inventory(user_id, opened_at);
         CREATE TABLE IF NOT EXISTS case_orders(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
             case_id INTEGER NOT NULL, method TEXT NOT NULL, amount INTEGER NOT NULL,
@@ -215,7 +110,7 @@ def init(owner_id: int):
                      ("tags", "coin_hidden INTEGER DEFAULT 0"),
                      ("tags", "hit INTEGER DEFAULT 0"),        # хит продаж
                      ("tags", "disc_pct INTEGER"),             # скидка на тег, %
-                     ("tags", "disc_until INTEGER"), ("cases", "price_rub INTEGER DEFAULT 0"), ("cases", "price_gold INTEGER DEFAULT 0"),
+                     ("tags", "disc_until INTEGER"), ("tags", "sort_order INTEGER"), ("cases", "price_rub INTEGER DEFAULT 0"), ("cases", "price_gold INTEGER DEFAULT 0"),
                      ("case_draws", "game_id TEXT"), ("case_draws", "issue_status TEXT DEFAULT 'not_requested'"),
                      ("case_draws", "requested_at INTEGER"), ("case_draws", "decided_at INTEGER")]:          # до какого времени (unix), NULL = бессрочно  # coins: своё число монет за покупку (NULL = % от цены)  # tag_id: промокод только на этот тег (NULL = на все)
         try:
@@ -546,27 +441,16 @@ def fav_events():
             kind, warned = "discount", 0
         elif cur_disc and left is not None and left <= FAV_WARN_HOURS * 3600 and not warned:
             kind, warned = "ending", 1
-        elif base is not None and last_price is not None and base != last_price:
-            kind = "raised" if base > last_price else "lowered"
+        elif base is not None and last_price is not None and base > last_price:
+            kind = "raised"
         elif last_disc and not cur_disc:
             kind, warned = "ended", 0
         if cur_disc and left is not None and left > FAV_WARN_HOURS * 3600:
             warned = 0
         if (cur_disc, base, warned) != (last_disc, last_price, r["end_warned"] or 0):
-            # Не подтверждаем событие до успешной отправки уведомления:
-            # иначе временная ошибка Telegram теряет уведомление навсегда.
-            if not kind:
-                _conn.execute("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
-                              (cur_disc, base, warned, r["user_id"], r["id"]))
+            _conn.execute("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
+                          (cur_disc, base, warned, r["user_id"], r["id"]))
         if kind:
-            out.append((r["user_id"], r, kind, {"old": last_price, "new": base, "left": left,
-                                                 "pct": cur_disc, "_state": (cur_disc, base, warned)}))
+            out.append((r["user_id"], r, kind, {"old": last_price, "new": base, "left": left, "pct": cur_disc}))
     _conn.commit()
     return out
-
-
-def fav_mark_notified(uid, tag_id, state):
-    """Фиксирует состояние только после успешной доставки уведомления."""
-    cur_disc, base, warned = state
-    ex("UPDATE favorites SET last_disc=?, last_price=?, end_warned=? WHERE user_id=? AND tag_id=?",
-       (cur_disc, base, warned, uid, tag_id))

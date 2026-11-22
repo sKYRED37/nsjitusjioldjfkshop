@@ -2,22 +2,15 @@ import asyncio
 import re
 import secrets
 import time
-import logging
-import os
-import io
-import random
-
-from PIL import Image, ImageDraw, ImageFont
 
 from aiogram import Router, F, Bot
 from aiogram.filters import Command, StateFilter
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, FSInputFile, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, FSInputFile
 
 import db
-import roulette
 from user import esc, fmt, kb, btn, show, send_review_prompt, left_str
 import links
 import texts
@@ -49,6 +42,7 @@ class A(StatesGroup):
     banner = State()
     ent_banner = State()
     page_banner = State()
+    tag_move_page = State()
     cat_rename = State()
     tag_edit = State()
     price_edit = State()
@@ -130,92 +124,31 @@ async def admin_cases(c: CallbackQuery, state: FSMContext = None):
     cases = db.q("SELECT * FROM cases ORDER BY id DESC")
     rows = [[btn(f"{x['name']} · {x['price_rub']} ₽ / {x['price_gold']} голды", f"adm:caseview:{x['id']}")] for x in cases]
     rows += [[btn("➕ Создать кейс", "adm:caseadd")], back()]
-    await show(c, "🎁 <b>Кейсы</b>\nСоздание через кнопки: введи название и цены, затем нажимай на теги, чтобы добавить или убрать их из пула.", kb(rows))
+    await show(c, "🎁 <b>Кейсы</b>\nСоздание: название | редкость | цена ₽ | цена голды | ID тегов", kb(rows))
 
 
 @router.callback_query(F.data == "adm:caseadd")
 async def admin_case_add(c: CallbackQuery, state: FSMContext):
     await state.set_state(A.case_create)
-    await state.update_data(case_selected=[])
-    await show(c, "Введи название, цену в рублях и цену в голде через |\nПример: <code>Золотой | 199 | 50</code>\nНулём отключается соответствующий способ оплаты.", kb([back("adm:cases")]))
+    await show(c, "Пришли одной строкой:\n<code>Название | Обычный/Редкий/Легендарный | цена ₽ | цена голды | id_тегов</code>\n\nПример: <code>Золотой | Редкий | 199 | 50 | 1,2,5</code>", kb([back("adm:cases")]))
 
 
 @router.message(A.case_create)
 async def admin_case_save(m: Message, state: FSMContext):
     try:
-        name, rub, gold = [x.strip() for x in (m.text or "").split("|", 2)]
-        if not name or int(rub) < 0 or int(gold) < 0 or (int(rub) == 0 and int(gold) == 0):
+        name, rarity, rub, gold, ids = [x.strip() for x in (m.text or "").split("|", 4)]
+        if rarity not in ("Обычный", "Редкий", "Легендарный") or int(rub) < 0 or int(gold) < 0 or (int(rub) == 0 and int(gold) == 0):
             raise ValueError()
-    except Exception:
-        return await m.answer("Формат: Название | цена ₽ | цена голды. Например: Золотой | 199 | 50")
-    await state.update_data(case_name=name, case_rub=int(rub), case_gold=int(gold))
-    await state.set_state(A.case_create)
-    await case_pool_view(m, state)
-
-
-async def case_pool_view(target, state):
-    data = await state.get_data()
-    tags = _all_tags()
-    selected = set(data.get("case_selected", []))
-    rows = []
-    cells = []
-    for tg in tags:
-        mark = "☑️ " if tg["id"] in selected else "⬜ "
-        cells.append(btn(mark + tg["name"], f"adm:casepick:{tg['id']}"))
-    rows.extend(_grid(cells))
-    rows.append([btn(f"✅ Создать кейс ({len(selected)} тег.)", "adm:casesave", style="success")])
-    rows.append(back("adm:cases"))
-    text = f"🎁 <b>{esc(data['case_name'])}</b> · {data['case_rub']} ₽ / {data['case_gold']} голды\n\nНажимай на названия тегов: ☑️ — добавлен в пул, ⬜ — не выбран. Можно выбрать несколько."
-    markup = kb(rows)
-    if isinstance(target, Message):
-        await target.answer(text, reply_markup=markup)
-    else:
-        await show(target, text, markup)
-
-
-@router.callback_query(F.data.regexp(r"^adm:casepick:\d+$"))
-async def admin_case_pick(c: CallbackQuery, state: FSMContext):
-    # Не принимаем старые кнопки после выхода из мастера создания кейса.
-    if await state.get_state() != A.case_create.state:
-        return await c.answer("Создание кейса уже завершено. Открой его заново.", show_alert=True)
-    tid = int(c.data.split(":")[2])
-    data = await state.get_data()
-    if not data.get("case_name"):
-        return await c.answer("Сначала введи название и цены кейса.", show_alert=True)
-    selected = set(data.get("case_selected", []))
-    if tid in selected: selected.remove(tid)
-    elif db.one("SELECT id FROM tags WHERE id=?", (tid,)): selected.add(tid)
-    await state.update_data(case_selected=sorted(selected))
-    await case_pool_view(c, state)
-
-
-@router.callback_query(F.data == "adm:casesave")
-async def admin_case_save_buttons(c: CallbackQuery, state: FSMContext):
-    if await state.get_state() != A.case_create.state:
-        return await c.answer("Создание кейса уже завершено. Открой его заново.", show_alert=True)
-    data = await state.get_data()
-    ids = sorted(set(data.get("case_selected", [])))
-    if not data.get("case_name") or data.get("case_rub") is None or data.get("case_gold") is None:
-        return await c.answer("Сначала введи название и цены кейса.", show_alert=True)
-    if not ids:
-        return await c.answer("Сначала выбери хотя бы один тег", show_alert=True)
-    # Повторно проверяем теги перед сохранением: их могли удалить во время создания.
-    valid_ids = {row["id"] for row in db.q(
-        "SELECT id FROM tags WHERE id IN (" + ",".join("?" for _ in ids) + ")", tuple(ids)
-    )}
-    ids = [tid for tid in ids if tid in valid_ids]
-    if not ids:
-        return await c.answer("Выбранные теги больше не существуют. Выбери теги заново.", show_alert=True)
-    cid = db.ex("INSERT INTO cases(name,rarity,price,active,price_rub,price_gold) VALUES(?,?,0,1,?,?)",
-                (data["case_name"], "Обычный", data["case_rub"], data["case_gold"]))
-    try:
-        for tid in ids:
+        tag_ids = list(dict.fromkeys(int(x.strip()) for x in ids.split(",") if x.strip()))
+        if not name or not tag_ids or any(not db.one("SELECT id FROM tags WHERE id=?", (tid,)) for tid in tag_ids):
+            raise ValueError()
+        cid = db.ex("INSERT INTO cases(name,rarity,price,active,price_rub,price_gold) VALUES(?,?,0,1,?,?)", (name, rarity, int(rub), int(gold)))
+        for tid in tag_ids:
             db.ex("INSERT INTO case_tags(case_id,tag_id) VALUES(?,?)", (cid, tid))
     except Exception:
-        db.ex("DELETE FROM cases WHERE id=?", (cid,))
-        raise
+        return await m.answer("Формат неверный. Пример: Название | Редкий | 199 | 50 | 1,2,5")
     await state.clear()
-    await show(c, f"✅ Кейс «{esc(data['case_name'])}» создан. Выбрано тегов: {len(ids)}.", kb([[btn("🎁 К кейсам", "adm:cases")]]))
+    await m.answer(f"✅ Кейс «{esc(name)}» создан. ID: {cid}", reply_markup=kb([[btn("🎁 К кейсам", "adm:cases")], back()]))
 
 
 @router.callback_query(F.data.regexp(r"^adm:caseview:\d+$"))
@@ -272,52 +205,30 @@ async def admin_case_issue_decide(c: CallbackQuery, bot: Bot):
 @router.callback_query(F.data.regexp(r"^adm:case(ok|no):\d+$"))
 async def admin_case_order_decide(c: CallbackQuery, bot: Bot):
     _, action, oid = c.data.split(":")
-    order_id = int(oid)
-    order = db.one("SELECT * FROM case_orders WHERE id=?", (order_id,))
+    order = db.one("SELECT * FROM case_orders WHERE id=?", (int(oid),))
     if not order or order["status"] != "pending":
         return await c.answer("Заказ уже обработан или не найден", show_alert=True)
-
     if action == "caseok":
-        try:
-            result = db.claim_case_order(order_id)
-        except Exception:
-            logging.exception("Не удалось подтвердить заказ кейса %s", order_id)
-            return await c.answer("Ошибка сохранения результата. Попробуй ещё раз.", show_alert=True)
-        if not result:
-            return await c.answer("Заказ уже обработан другим администратором", show_alert=True)
-        if result.get("error") == "empty_pool":
-            return await c.answer("В пуле этого кейса нет доступных тегов", show_alert=True)
-
+        pool = db.q("SELECT t.id FROM case_tags ct JOIN tags t ON t.id=ct.tag_id WHERE ct.case_id=? AND t.hidden=0 AND t.closed=0", (order["case_id"],))
+        if not pool:
+            return await c.answer("В пуле кейса нет доступных тегов", show_alert=True)
+        import random
+        chosen = random.choice(pool)
+        db.ex("UPDATE case_orders SET status='paid',tag_id=? WHERE id=? AND status='pending'", (chosen["id"], order["id"]))
         case = db.one("SELECT name FROM cases WHERE id=?", (order["case_id"],))
-        case_name = case["name"] if case else "Кейс"
-        try:
-            await bot.send_message(
-                order["user_id"],
-                f"✅ Оплата кейса «{esc(case_name)}» подтверждена!\n\n"
-                f"🎒 Кейс добавлен в раздел «Мои кейсы». Открой его самостоятельно нажатием кнопки в этом разделе."
-            )
-        except Exception:
-            logging.exception("Не удалось уведомить пользователя о подтверждении кейса")
-        result_text = f"\n\n✅ Подтверждено. Кейс добавлен покупателю в «Мои кейсы» (позиция #{result['inventory_id']})."
+        tag = db.one("SELECT name FROM tags WHERE id=?", (chosen["id"],))
+        db.ex("INSERT INTO case_draws(user_id,case_id,tag_id,price,created_at) VALUES(?,?,?,?,?)", (order["user_id"], order["case_id"], chosen["id"], order["amount"], int(time.time())))
+        try: await bot.send_message(order["user_id"], f"🎉 Оплата кейса «{esc(case['name'])}» подтверждена!\nТебе выпал тег: <b>{esc(tag['name'])}</b>.\nОн сохранён в разделе «🎒 Мои кейсы».")
+        except Exception: pass
+        result = f"\n\n✅ Подтверждено. Выдан тег: {esc(tag['name'])}"
     else:
-        changed = db.reject_case_order(order_id)
-        if not changed:
-            return await c.answer("Заказ уже обработан", show_alert=True)
-        try:
-            await bot.send_message(order["user_id"], f"❌ Оплата кейса #{order_id} отклонена владельцем. Если это ошибка, свяжись с поддержкой.")
-        except Exception:
-            logging.exception("Не удалось уведомить пользователя об отклонении оплаты")
-        result_text = "\n\n❌ Оплата отклонена"
-    try:
-        await c.message.edit_caption((c.message.caption or "") + result_text, reply_markup=None)
-    except Exception:
-        try:
-            await c.message.edit_reply_markup(reply_markup=None)
-        except Exception:
-            logging.info("Не удалось обновить сообщение администратора по заказу кейса %s", order_id)
+        db.ex("UPDATE case_orders SET status='rejected' WHERE id=? AND status='pending'", (order["id"],))
+        try: await bot.send_message(order["user_id"], f"❌ Оплата кейса #{order['id']} отклонена владельцем. Если это ошибка, свяжись с поддержкой.")
+        except Exception: pass
+        result = "\n\n❌ Оплата отклонена"
+    try: await c.message.edit_caption((c.message.caption or "") + result, reply_markup=None)
+    except Exception: pass
     await c.answer("Решение сохранено")
-
-
 
 
 # ---------------- заказы ----------------
@@ -495,7 +406,8 @@ async def cat_view(c, cid, page=0):
     cat = db.one("SELECT * FROM categories WHERE id=?", (cid,))
     if not cat:
         return await c.answer("Нет такого раздела", show_alert=True)
-    tags = db.q("SELECT * FROM tags WHERE category_id=? ORDER BY id", (cid,))
+    tags = db.q("SELECT * FROM tags WHERE category_id=? "
+                  "ORDER BY CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END, sort_order, id", (cid,))
     pages = max(1, (len(tags) + ADM_PAGE - 1) // ADM_PAGE)
     page = max(0, min(page, pages - 1))
     rows = [[btn(("🙈 " if tg["hidden"] else "") + ("🔒 " if tg["closed"] else "") + tg["name"], f"adm:tag:{tg['id']}")] for tg in tags[page * ADM_PAGE:(page + 1) * ADM_PAGE]]
@@ -821,6 +733,7 @@ async def tag_view(c, tid):
     rows = [[btn(f"{p['term']} — {fmt(p['price_rub'])}₽" + (f" / {fmt(p['price_gold'])}г" if p['price_gold'] else "") + (f" / {fmt(p['price_stars'])}⭐" if p['price_stars'] else "") + (f" / {p['price_boosts']}🚀" if p['price_boosts'] else "") + (" 🔗" if p['url'] else "") + (" 🔒" if p['closed'] else ""), f"adm:pr:{p['id']}")] for p in prices]
     rows.append([btn("➕ Добавить цены", f"adm:pr_add:{tid}"), btn("🔢 Места", f"adm:slots:{tid}")])
     rows.append([btn("✏️ Название/описание", f"adm:tag_ed:{tid}"), btn("🖼 Баннер" + (" ✓" if t["banner"] else ""), f"adm:eb:tag:{tid}")])
+    rows.append([btn("📄 Переместить на страницу", f"adm:tag_move:{tid}")])
     rows.append([btn("🔓 Открыть покупку" if t["closed"] else "🔒 Закрыть покупку", f"adm:tag_c:{tid}")])
     rows.append([btn("👁 Показать пользователям" if t["hidden"] else "🙈 Скрыть от пользователей", f"adm:tag_h:{tid}")])
     rows.append([btn("🪙 Вернуть в магазин RECOINS" if t["coin_hidden"] else "🪙 Убрать из магазина RECOINS", f"adm:tag_ch:{tid}")])
@@ -1099,47 +1012,24 @@ async def cb_bc(c: CallbackQuery, state: FSMContext):
     await show(c, "📢 Отправь текст рассылки (получат все пользователи бота):", kb([back()]))
 
 
-@router.message(A.broadcast)
+@router.message(A.broadcast, F.text, ~F.text.startswith("/"))
 async def got_bc(m: Message, state: FSMContext, bot: Bot):
-    """Рассылает любое сообщение администратора: текст, фото с подписью,
-    пересланный пост, видео, документ и другие типы, поддерживаемые copyMessage.
-    Копирование сохраняет подпись и форматирование, но не добавляет автора
-    пересылки от имени админа.
-    """
-    # Не завершаем рассылку пустым/служебным сообщением.
-    if not m.content_type or m.content_type == "unknown":
-        return await m.answer("Не удалось распознать сообщение. Отправь текст, фото с подписью или перешли пост ещё раз.")
-
     await state.clear()
-    status = await m.answer("📢 Рассылка запущена…")
     ok = bad = 0
-    users = db.q("SELECT user_id FROM users WHERE COALESCE(banned,0)=0")
-    for u in users:
-        uid = u["user_id"]
+    await m.answer("📢 Рассылка запущена…")
+    for u in db.q("SELECT user_id FROM users WHERE COALESCE(banned,0)=0"):
         for attempt in range(3):
             try:
-                await bot.copy_message(
-                    chat_id=uid,
-                    from_chat_id=m.chat.id,
-                    message_id=m.message_id,
-                )
+                await bot.send_message(u["user_id"], m.html_text)
                 ok += 1
                 break
             except TelegramRetryAfter as e:
-                if attempt == 2:
-                    bad += 1
-                else:
-                    await asyncio.sleep(e.retry_after + 1)
+                await asyncio.sleep(e.retry_after + 1)
             except Exception:
                 bad += 1
                 break
-        # Не превышаем общий лимит отправки сообщений Telegram.
-        await asyncio.sleep(0.05)
-
-    await status.edit_text(
-        f"📢 Рассылка завершена. Доставлено: {ok}, ошибок: {bad}.",
-        reply_markup=kb([back()]),
-    )
+        await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/сек
+    await m.answer(f"📢 Рассылка завершена. Доставлено: {ok}, ошибок: {bad}.", reply_markup=kb([back()]))
 
 
 # ---------------- места ----------------
@@ -1253,6 +1143,50 @@ async def got_cat_ren(m: Message, state: FSMContext):
     db.ex("UPDATE categories SET name=? WHERE id=?", (m.text.strip(), d["cid"]))
     await state.clear()
     await m.answer("✅ Переименовано.", reply_markup=kb([[btn("🗂 К разделу", f"adm:cat:{d['cid']}")]]))
+
+
+@router.callback_query(F.data.regexp(r"^adm:tag_move:\d+$"))
+async def cb_tag_move(c: CallbackQuery, state: FSMContext):
+    tid = int(c.data.split(":")[2])
+    tg = db.one("SELECT id, category_id, name FROM tags WHERE id=?", (tid,))
+    if not tg:
+        return await c.answer("Тег не найден", show_alert=True)
+    visible = db.visible_tag_count(tg["category_id"])
+    pages = max(1, (visible + db.USER_PAGE - 1) // db.USER_PAGE)
+    await state.set_state(A.tag_move_page)
+    await state.update_data(tid=tid, cid=tg["category_id"])
+    await show(c, f"На какую страницу каталога переместить тег <b>{esc(tg['name'])}</b>?\\n"
+                  f"Сейчас страниц: {pages}. Отправь номер страницы от 1 до {pages + 1}. "
+                  f"Тег будет добавлен в начало выбранной страницы.",
+               kb([back(f"adm:tag:{tid}")]))
+
+
+@router.message(A.tag_move_page, F.text, ~F.text.startswith("/"))
+async def got_tag_move_page(m: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        target_page = int(m.text.strip())
+    except ValueError:
+        return await m.answer("Отправь номер страницы цифрами.")
+    ids = [r["id"] for r in db.q(
+        "SELECT id FROM tags WHERE category_id=? "
+        "ORDER BY CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END, sort_order, id",
+        (data["cid"],))]
+    if target_page < 1 or target_page > len(ids) // db.USER_PAGE + 1:
+        return await m.answer(f"Укажи страницу от 1 до {len(ids) // db.USER_PAGE + 1}.")
+    tid = data["tid"]
+    if tid not in ids:
+        await state.clear()
+        return await m.answer("Тег уже не найден.")
+    ids.remove(tid)
+    insert_at = min((target_page - 1) * db.USER_PAGE, len(ids))
+    ids.insert(insert_at, tid)
+    for pos, tag_id in enumerate(ids, 1):
+        db.ex("UPDATE tags SET sort_order=? WHERE id=?", (pos, tag_id))
+    await state.clear()
+    await m.answer(f"✅ Тег перемещён на страницу {target_page}.",
+                   reply_markup=kb([[btn("🏷 К тегу", f"adm:tag:{tid}")],
+                                    [btn("🗂 К разделу", f"adm:cat:{data['cid']}")]]))
 
 
 @router.callback_query(F.data.regexp(r"^adm:tag_ed:\d+$"))

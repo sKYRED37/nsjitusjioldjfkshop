@@ -1,9 +1,9 @@
 import asyncio
 import hashlib
 import logging
+import os
 import html
 import re
-import random
 import time
 
 from aiogram import Router, F, Bot, BaseMiddleware
@@ -35,7 +35,6 @@ class Ask(StatesGroup):
 
 class TagSearch(StatesGroup):
     query = State()
-    mode = State()
 
 
 class CasePayment(StatesGroup):
@@ -72,9 +71,9 @@ def kb(rows):
 
 
 # Цвет кнопок: по умолчанию эмодзи 🟢 (скидка) и 🔴 (хит в админке) — работает везде.
-USE_NATIVE_STYLE = True  # Используем нативные цвета кнопок, если установленный aiogram их поддерживает.
+USE_NATIVE_STYLE = False  # True — красить кнопки средствами Telegram (если у тебя новый aiogram и Telegram их принимает)
 STYLE_OK = USE_NATIVE_STYLE and "style" in getattr(InlineKeyboardButton, "model_fields", {})
-_FALLBACK_EMOJI = {"success": "", "danger": ""}
+_FALLBACK_EMOJI = {"success": "🟢 ", "danger": "🔴 "}
 
 
 def btn(text, data=None, url=None, style=None):
@@ -86,18 +85,18 @@ def btn(text, data=None, url=None, style=None):
 
 
 def tag_label(tg):
-    """Подпись тега: скидка показывается компактно, без цветных маркеров."""
+    """Подпись тега: хит отмечается огоньком, скидка — зелёным маркером и полным текстом."""
     pct = db.disc_of(tg)
-    name = tg["name"] + (f" - {pct}%" if pct else "")
-    return ("🔥 " if tg["hit"] else "") + name
+    name = tg["name"] + (f" - Скидка {pct}%" if pct else "")
+    return ("🔥 " if tg["hit"] else "") + (("🟢 " + name) if pct else name)
 
 
 def tag_btn(tg, data):
-    """Кнопка тега: скидка — нативный зелёный стиль, хит — красный."""
-    pct = db.disc_of(tg)
-    style = "success" if pct else ("danger" if tg["hit"] else None)
-    label = tg["name"] + (f" - {pct}%" if pct else "")
-    return btn(("🔒 " if tg["closed"] else "") + label, data, style=style)
+    """Кнопка тега: хит — красный стиль, скидка — зелёный стиль; закрытый — с замком."""
+    # Если одновременно хит и скидка, приоритет красного стиля у хита,
+    # а скидка дополнительно отмечается зелёным маркером в подписи.
+    style = "danger" if tg["hit"] else ("success" if db.disc_of(tg) else None)
+    return btn(("🔒 " if tg["closed"] else "") + tag_label(tg), data, style=style)
 
 
 def left_str(sec):
@@ -126,6 +125,13 @@ async def show(target, text, markup=None, banner=None, fid=None, gen=None):
         fid = _banner_ids.get(gen_key) or BufferedInputFile(gen[1], filename="banner.jpg")
     elif not fid and banner:
         fid = db.get_setting("banner_" + banner)
+        # Для каталога тегов используем предоставленный фон; ручной баннер страницы
+        # передаётся через fid и имеет приоритет.
+        if banner == "tags" and not fid:
+            bg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tags_background.jpg")
+            if os.path.isfile(bg_path):
+                with open(bg_path, "rb") as bg_file:
+                    fid = BufferedInputFile(bg_file.read(), filename="tags_background.jpg")
     if fid and len(text) > 1000:
         fid = ""  # подпись к фото ограничена 1024 символами — длинный экран показываем без баннера
         gen_key = None
@@ -175,12 +181,11 @@ def main_menu():
     rv = reviews_link()
     row3 = ([btn(g("btn_reviews"), url=rv)] if rv else []) + [btn(g("btn_help"), "menu:help")]
     return kb([
-        # Главная витрина — отдельная центральная кнопка на всю ширину.
         [btn(g("btn_catalog"), "menu:catalog")],
-        # Остальные разделы — аккуратная сетка по две кнопки в строке.
-        [btn("🎁 Кейсы", "cases:list"), btn(g("btn_fav"), "menu:fav")],
+        [btn("🔎 Умный поиск тегов", "search:open"), btn("🎁 Кейсы", "cases:list")],
         [btn(g("btn_coins"), "menu:coins"), btn(g("btn_bonus"), "menu:bonus")],
         [btn(g("btn_promo"), "menu:promo"), btn(g("btn_orders"), "menu:orders")],
+        [btn(g("btn_fav"), "menu:fav")],
         row3,
         [btn(g("btn_rules"), "menu:rules")],
     ])
@@ -285,198 +290,40 @@ async def cb_orders(c: CallbackQuery, state: FSMContext):
 
 
 
-# ---------------- поиск тегов в каталоге ----------------
-def catalog_search_menu():
-    return kb([
-        [btn("🔤 По названию", "search:mode:name")],
-        [btn("💰 По цене", "search:mode:price")],
-        [btn("📅 По сроку", "search:mode:days")],
-        [btn("↩️ Вернуться в каталог", "menu:catalog")],
-    ])
-
-
-def search_cancel_markup():
-    return kb([[btn("✖️ Отменить поиск", "search:cancel")],
-               [btn("↩️ Вернуться в каталог", "menu:catalog")]])
-
-
-def parse_search_days(raw):
-    """Минимальный срок поиска в днях; None означает поиск бессрочных предложений."""
-    value = (raw or "").strip().casefold().replace("ё", "е")
-    if value in ("бессрочно", "навсегда", "без срока", "безлимит", "∞", "бесконечно"):
-        return float("inf")
-    if not value:
-        raise ValueError
-    match = re.search(r"\d+", value)
-    if not match:
-        # Понятные словесные значения сроков.
-        if "недел" in value:
-            return 7
-        if "месяц" in value:
-            return 30
-        if "год" in value or "лет" in value:
-            return 365
-        if "дн" in value or "день" in value:
-            return 1
-        raise ValueError
-    amount = int(match.group())
-    if amount < 1:
-        raise ValueError
-    if "недел" in value:
-        amount *= 7
-    elif "месяц" in value:
-        amount *= 30
-    elif "год" in value or "лет" in value:
-        amount *= 365
-    # Верхнего ограничения нет: поддерживается любой положительный срок.
-    return amount
-
-
-def offer_duration_days(term):
-    """Преобразует срок предложения в дни. Бессрочные сроки обозначаются None."""
-    value = str(term or "").strip().casefold().replace("ё", "е")
-    if any(word in value for word in ("бессроч", "навсегда", "без срока", "безлимит", "∞")):
-        return float("inf")
-    match = re.search(r"\d+", value)
-    if match:
-        amount = int(match.group())
-        if "недел" in value:
-            return amount * 7
-        if "месяц" in value:
-            return amount * 30
-        if "год" in value or "лет" in value:
-            return amount * 365
-        if "дн" in value or "день" in value or not re.search(r"[а-яa-z]", value):
-            return amount
-    if "недел" in value:
-        return 7
-    if "месяц" in value:
-        return 30
-    if "год" in value or "лет" in value:
-        return 365
-    if "дн" in value or "день" in value:
-        return 1
-    return None
-
-
+# ---------------- умный поиск ----------------
 @router.callback_query(F.data == "search:open")
 async def search_open(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await state.set_state(TagSearch.mode)
-    await show(c, "🔎 <b>Поиск тега</b>\nВыбери способ поиска:", catalog_search_menu())
-
-
-@router.callback_query(F.data.regexp(r"^search:mode:(name|price|days)$"))
-async def search_mode(c: CallbackQuery, state: FSMContext):
-    mode = c.data.rsplit(":", 1)[1]
-    await state.clear()
-    await state.update_data(search_mode=mode)
-    if mode == "price":
-        await state.set_state(TagSearch.mode)
-        await show(c, "💰 <b>Поиск по цене</b>\nВыбери валюту максимальной цены:", kb([
-            [btn("₽ Рубли", "search:currency:rub")],
-            [btn("⭐ Звёзды", "search:currency:stars")],
-            [btn("🪙 Голда", "search:currency:gold")],
-            [btn("✖️ Отменить поиск", "search:cancel")],
-            [btn("↩️ Вернуться в каталог", "menu:catalog")],
-        ]))
-        return
-    prompt = ("🔤 Введи название тега или его часть:" if mode == "name" else
-              "📅 Введи минимальный срок от 1 дня до любого количества дней (например: 1, 30, 90, 365, 10000) или «бессрочно»:")
     await state.set_state(TagSearch.query)
-    await show(c, prompt, search_cancel_markup())
-
-
-@router.callback_query(F.data.regexp(r"^search:currency:(rub|stars|gold)$"))
-async def search_currency(c: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if data.get("search_mode") != "price":
-        await state.clear()
-        return await show(c, "Сессия поиска устарела. Начни поиск заново.", kb([
-            [btn("🔎 Искать ещё", "search:open")], [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
-    currency = c.data.rsplit(":", 1)[1]
-    await state.update_data(search_currency=currency)
-    await state.set_state(TagSearch.query)
-    labels = {"rub": "рублях ₽", "stars": "звёздах ⭐", "gold": "голде 🪙"}
-    await show(c, f"💰 Введи максимальную цену в {labels[currency]} (целое число от 1):", search_cancel_markup())
-
-
-@router.callback_query(F.data == "search:cancel")
-async def search_cancel(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await show(c, "Поиск отменён.", kb([[btn("🔎 Искать ещё", "search:open")],
-                                         [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
+    await show(c, "🔎 <b>Умный поиск тегов</b>\n\nВведи параметры через точку с запятой:\n<code>название;мин.цена;макс.цена;мин.длина;макс.длина;скидка;хит</code>\n\nПример: <code>dragon;100;1000;3;12;1;0</code>\nПустое поле означает «любой». Для скидки и хита: 1 — да, 0 — нет.", back_menu())
 
 
 @router.message(TagSearch.query)
 async def search_run(m: Message, state: FSMContext):
-    data = await state.get_data()
-    mode = data.get("search_mode")
-    raw = (m.text or "").strip()
-    if not raw:
-        return await m.answer("Введи значение или отмени поиск.", reply_markup=search_cancel_markup())
+    raw = (m.text or "").strip().split(";")
+    raw += [""] * (7-len(raw))
+    name, lo, hi, lmin, lmax, discount, hit = [x.strip() for x in raw[:7]]
     try:
-        # Берём только видимые теги с доступными предложениями. Закрытые сроки
-        # не участвуют в поиске и не могут привести к карточке без актуальной цены.
-        sql = """SELECT t.* FROM tags t
-                 WHERE COALESCE(t.hidden,0)=0 AND COALESCE(t.closed,0)=0
-                   AND (t.slots IS NULL OR t.slots>0)
-                   AND EXISTS (SELECT 1 FROM prices p WHERE p.tag_id=t.id
-                               AND COALESCE(p.closed,0)=0
-                               AND (COALESCE(p.price_rub,0)>0 OR COALESCE(p.price_gold,0)>0
-                                    OR COALESCE(p.price_stars,0)>0))
-                 ORDER BY t.id DESC"""
-        tags = db.q(sql)
-        matches = []
-        if mode == "name":
-            needle = raw.casefold()
-            matches = [tg for tg in tags if needle in str(tg["name"]).casefold()]
-        elif mode == "price":
-            currency = data.get("search_currency")
-            col = {"rub": "price_rub", "stars": "price_stars", "gold": "price_gold"}.get(currency)
-            if not col:
-                raise ValueError
-            maximum = int(raw.replace(" ", "").replace(",", ""))
-            if maximum < 1:
-                raise ValueError
-            promo = db.active_promo(m.from_user.id)
-            for tg in tags:
-                pct = db.total_pct(promo, tg["id"])
-                offers = db.q(f"SELECT {col} amount FROM prices WHERE tag_id=? AND COALESCE(closed,0)=0 AND COALESCE({col},0)>0", (tg["id"],))
-                if any(db.apply_discount(o["amount"], pct) <= maximum for o in offers):
-                    matches.append(tg)
-        elif mode == "days":
-            wanted = parse_search_days(raw)
-            for tg in tags:
-                offers = db.q("""SELECT term FROM prices WHERE tag_id=? AND COALESCE(closed,0)=0
-                                AND (COALESCE(price_rub,0)>0 OR COALESCE(price_gold,0)>0 OR COALESCE(price_stars,0)>0)""", (tg["id"],))
-                durations = [offer_duration_days(o["term"]) for o in offers]
-                if wanted == float("inf"):
-                    suitable = any(d == float("inf") for d in durations)
-                else:
-                    suitable = any(d == float("inf") or (d is not None and d >= wanted) for d in durations)
-                if suitable:
-                    matches.append(tg)
-        else:
-            await state.clear()
-            return await m.answer("Сессия поиска устарела. Начни поиск заново.", reply_markup=kb([
-                [btn("🔎 Искать ещё", "search:open")], [btn("↩️ Вернуться в каталог", "menu:catalog")]]))
-        matches = matches[:50]
-    except (ValueError, TypeError):
-        if mode == "price":
-            hint = "Введи целое положительное число цены."
-        elif mode == "days":
-            hint = "Введи срок от 1 дня (например, 30 или 90) либо «бессрочно»."
-        else:
-            hint = "Введи название или часть названия тега."
-        return await m.answer("Некорректный ввод. " + hint, reply_markup=search_cancel_markup())
+        sql = """SELECT t.*, MIN(p.price_rub) min_price FROM tags t
+                 LEFT JOIN prices p ON p.tag_id=t.id
+                 WHERE t.hidden=0 AND t.closed=0"""
+        args = []
+        if name: sql += " AND lower(t.name) LIKE ?"; args.append("%"+name.lower()+"%")
+        if lo: sql += " AND p.price_rub >= ?"; args.append(int(lo))
+        if hi: sql += " AND p.price_rub <= ?"; args.append(int(hi))
+        if lmin: sql += " AND length(t.name) >= ?"; args.append(int(lmin))
+        if lmax: sql += " AND length(t.name) <= ?"; args.append(int(lmax))
+        if discount == "1": sql += " AND COALESCE(t.disc_pct,0)>0 AND (t.disc_until IS NULL OR t.disc_until>?)"; args.append(int(time.time()))
+        if discount == "0": sql += " AND COALESCE(t.disc_pct,0)=0"
+        if hit in ("0","1"): sql += " AND COALESCE(t.hit,0)=?"; args.append(int(hit))
+        sql += " GROUP BY t.id ORDER BY t.hit DESC, t.id DESC LIMIT 30"
+        rows = db.q(sql, tuple(args))
+    except (ValueError, Exception) as e:
+        await state.clear()
+        return await m.answer("Не удалось разобрать фильтры. Проверь числа и попробуй снова.", reply_markup=back_menu())
     await state.clear()
-    buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in matches]
-    buttons += [[btn("🔎 Искать ещё", "search:open")],
-                [btn("↩️ Вернуться в каталог", "menu:catalog")]]
-    await m.answer((f"🔎 Найдено тегов: {len(matches)}" if matches else
-                    "По этому запросу нет доступных тегов или предложений."),
-                   reply_markup=kb(buttons))
+    buttons = [[tag_btn(tg, f"tag:{tg['id']}")] for tg in rows]
+    buttons += [[btn("🔎 Изменить фильтры", "search:open")], [btn(t("btn_menu"), "menu:main")]]
+    await m.answer(f"Найдено тегов: {len(rows)}" if rows else "По заданным фильтрам ничего не найдено.", reply_markup=kb(buttons))
 
 
 # ---------------- кейсы: оплата скриншотом и подтверждение владельцем ----------------
@@ -490,26 +337,10 @@ async def cases_list(c: CallbackQuery):
 
 @router.callback_query(F.data == "cases:mine")
 async def cases_mine(c: CallbackQuery):
-    inventory = db.q(
-        "SELECT i.*, cs.name case_name FROM case_inventory i JOIN cases cs ON cs.id=i.case_id "
-        "WHERE i.user_id=? AND i.opened_at IS NULL ORDER BY i.id DESC LIMIT 50",
-        (c.from_user.id,)
-    )
-    rows = db.q(
-        "SELECT d.*, c.name case_name, t.name tag_name FROM case_draws d "
-        "JOIN cases c ON c.id=d.case_id JOIN tags t ON t.id=d.tag_id "
-        "WHERE d.user_id=? ORDER BY d.id DESC LIMIT 50", (c.from_user.id,)
-    )
+    rows = db.q("SELECT d.*, c.name case_name, t.name tag_name FROM case_draws d JOIN cases c ON c.id=d.case_id JOIN tags t ON t.id=d.tag_id WHERE d.user_id=? ORDER BY d.id DESC LIMIT 50", (c.from_user.id,))
     lines, buttons = [], []
-    if inventory:
-        lines.append("<b>📦 Неоткрытые кейсы</b>")
-        for item in inventory:
-            lines.append(f"🎁 <b>{esc(item['case_name'])}</b> · готов к открытию")
-            buttons.append([btn(f"🎰 Открыть · {esc(item['case_name'])}", f"cases:open:{item['id']}")])
-    if rows:
-        lines.append("<b>🏆 Выпавшие теги</b>")
     statuses = {
-        "not_requested": "🟡 Можно подать заявку на выдачу",
+        "not_requested": "🟡 Ожидает заявки на выдачу",
         "pending": "⏳ Заявка отправлена владельцу",
         "issued": "✅ Тег выдан",
         "refused": "❌ В выдаче отказано",
@@ -518,69 +349,9 @@ async def cases_mine(c: CallbackQuery):
         lines.append(f"🎁 <b>{esc(x['case_name'])}</b> → <b>{esc(x['tag_name'])}</b>\n{statuses.get(x['issue_status'] or 'not_requested', 'Статус уточняется')}")
         if (x["issue_status"] or "not_requested") in ("not_requested", "refused"):
             buttons.append([btn("📨 Подать заявку на выдачу · " + esc(x["tag_name"]), f"cases:issue:{x['id']}")])
-    text = "🎒 <b>Мои кейсы</b>\nЗдесь отображаются купленные кейсы. Нажми «Открыть», чтобы запустить рулетку.\n\n" + ("\n\n".join(lines) if lines else "Пока нет купленных кейсов.")
+    text = "🎒 <b>Мои кейсы</b>\nЗдесь находятся открытые кейсы и выпавшие теги. Чтобы получить тег в игре, подай заявку на выдачу.\n\n" + ("\n\n".join(lines) if lines else "Пока нет открытых кейсов.")
     buttons += [[btn("🎁 К кейсам", "cases:list")], [btn(t("btn_menu"), "menu:main")]]
     await show(c, text, kb(buttons))
-
-
-@router.callback_query(F.data.regexp(r"^cases:open:\d+$"))
-async def case_inventory_open(c: CallbackQuery, bot: Bot):
-    inventory_id = int(c.data.split(":")[2])
-    try:
-        result = db.open_case_inventory(inventory_id, c.from_user.id)
-    except Exception:
-        logging.exception("Ошибка открытия кейса inventory_id=%s", inventory_id)
-        return await c.answer("Не удалось открыть кейс. Попробуй ещё раз.", show_alert=True)
-    if not result:
-        return await c.answer("Этот кейс уже открыт или не найден", show_alert=True)
-    if result.get("error") == "empty_pool":
-        return await c.answer("В кейсе сейчас нет доступных тегов. Напиши владельцу.", show_alert=True)
-    await c.answer("🎰 Кейс открывается!")
-    # Текстовая рулетка: одно крупное сообщение обновляется по ходу прокрутки.
-    pool = list(dict.fromkeys(str(x).strip() for x in result["pool_names"] if str(x).strip()))
-    winner = str(result["tag_name"])
-    if winner not in pool:
-        pool.append(winner)
-    if not pool:
-        pool = [winner]
-
-    def reel_frame(tag: str, step: int, total: int, final: bool = False) -> str:
-        marker = "🟨" if final else "🔻"
-        state = "🏆 <b>ВЫПАЛО!</b>" if final else f"🎰 <b>РУЛЕТКА КРУТИТСЯ</b>  <code>{step}/{total}</code>"
-        return (
-            f"🎁 <b>ОТКРЫТИЕ КЕЙСА</b>\n"
-            f"<b>{esc(result['case_name'])}</b>\n\n"
-            f"{state}\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"       {marker}\n"
-            f"   <b>{esc(tag)}</b>\n"
-            f"       {marker}\n"
-            f"━━━━━━━━━━━━━━━━━━\n\n"
-            f"{'✨ ТВОЙ РЕЗУЛЬТАТ ✨' if final else 'Определяем выпавший тег…'}"
-        )
-
-    # Сначала показываем стартовое сообщение, затем обновляем его с ускорением/замедлением.
-    reel_message = await bot.send_message(
-        c.from_user.id,
-        reel_frame(random.choice(pool), 0, 18),
-    )
-    sequence = [random.choice(pool) for _ in range(17)] + [winner]
-    for index, tag in enumerate(sequence, start=1):
-        # Последние шаги становятся медленнее, создавая эффект остановки.
-        delay = 0.16 + 0.34 * ((index / len(sequence)) ** 2.4)
-        await asyncio.sleep(delay)
-        try:
-            await reel_message.edit_text(reel_frame(tag, index, len(sequence), final=(index == len(sequence))))
-        except TelegramBadRequest as exc:
-            if "message is not modified" not in str(exc).lower():
-                logging.warning("Не удалось обновить кадр текстовой рулетки: %s", exc)
-
-    await bot.send_message(
-        c.from_user.id,
-        f"🎉 <b>ПОЗДРАВЛЯЕМ!</b>\n\nВ кейсе «{esc(result['case_name'])}» выпал тег:\n"
-        f"🏆 <b>{esc(winner)}</b>\n\nРезультат сохранён в «🎒 Мои кейсы»." ,
-        reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")]])
-    )
 
 
 @router.callback_query(F.data.regexp(r"^cases:issue:\d+$"))
@@ -667,7 +438,7 @@ async def case_payment_proof(m: Message, state: FSMContext, bot: Bot):
         await state.clear(); return await m.answer("Кейс больше недоступен.")
     oid = db.ex("INSERT INTO case_orders(user_id,username,case_id,method,amount,proof,created_at) VALUES(?,?,?,?,?,?,?)", (m.from_user.id, m.from_user.username, case["id"], data["case_method"], data["case_amount"], file_id, int(time.time())))
     await state.clear()
-    await m.answer(f"✅ Заказ #{oid} отправлен владельцу на проверку. После подтверждения кейс появится в «Мои кейсы», и ты сможешь открыть его сам.", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")], [btn("🎁 К кейсам", "cases:list")]]))
+    await m.answer(f"✅ Заказ #{oid} отправлен владельцу на проверку. После подтверждения тег автоматически появится в разделе «Мои кейсы».", reply_markup=kb([[btn("🎒 Мои кейсы", "cases:mine")], [btn("🎁 К кейсам", "cases:list")]]))
     uname = f"@{m.from_user.username}" if m.from_user.username else str(m.from_user.id)
     caption = f"🎁 <b>Оплата кейса #{oid}</b>\nКейс: {esc(case['name'])} ({esc(case['rarity'])})\nПокупатель: {esc(uname)} / <code>{m.from_user.id}</code>\nСумма: {fmt(data['case_amount'])} {'₽' if data['case_method']=='card' else 'голды'}"
     markup = kb([[btn("✅ Подтвердить и выдать тег", f"adm:caseok:{oid}"), btn("❌ Отклонить", f"adm:caseno:{oid}")]])
@@ -685,7 +456,6 @@ async def cb_catalog(c: CallbackQuery, state: FSMContext):
     for cat in cats:
         n = db.one("SELECT COUNT(*) n FROM tags WHERE category_id=? AND hidden=0", (cat["id"],))["n"]
         rows.append([btn(f"{cat['name']} ({n})", f"cat:{cat['id']}:0")])
-    rows.append([btn("🔎 Поиск тега", "search:open")])
     rows.append([btn(t("btn_menu"), "menu:main")])
     await show(c, t("txt_catalog") if cats else t("txt_catalog_empty"), kb(rows), "catalog")
 
@@ -697,7 +467,8 @@ async def cb_cat(c: CallbackQuery):
     cat = db.one("SELECT * FROM categories WHERE id=?", (cid,))
     if not cat:
         return await c.answer(t("txt_cat_nf"), show_alert=True)
-    tags = db.q("SELECT * FROM tags WHERE category_id=? AND hidden=0 ORDER BY id", (cid,))
+    tags = db.q("SELECT * FROM tags WHERE category_id=? AND hidden=0 "
+                  "ORDER BY CASE WHEN sort_order IS NULL THEN 1 ELSE 0 END, sort_order, id", (cid,))
     pages = max(1, (len(tags) + PAGE - 1) // PAGE)
     page = max(0, min(page, pages - 1))
     chunk = tags[page * PAGE:(page + 1) * PAGE]
@@ -723,11 +494,8 @@ async def cb_cat(c: CallbackQuery):
         text = t("txt_cat_empty", name=esc(cat["name"]))
     manual = db.page_banner(cid, page)  # баннер, загруженный админом вручную, главнее автоматического
     gen = None
-    if not manual and chunk:
-        try:
-            gen = await make_tags_banner([tg["name"] for tg in chunk])
-        except Exception:
-            logging.exception("Не удалось собрать баннер страницы тегов")
+    # Фоновое изображение каталога используется вместо автоматически собранного
+    # баннера с плашками. Ручной баннер конкретной страницы остаётся приоритетным.
     await show(c, text, kb(rows), "tags", fid=manual or (None if gen else cat["banner"]), gen=gen)
 
 
